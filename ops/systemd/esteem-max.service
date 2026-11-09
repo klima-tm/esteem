@@ -1,0 +1,21 @@
+# /etc/systemd/system/esteem-max.service
+[Unit]
+Description=Esteem MAX automatic text replies
+Wants=network-online.target
+After=network-online.target
+[Service]
+Type=simple
+WorkingDirectory=/root/projects/esteem/max
+ExecStart=/root/projects/esteem/max/.venv/bin/python /root/projects/esteem/max/auto_reply.py
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=20
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/root/projects/esteem/max /root/.codex
+[Install]
+WantedBy=multi-user.target

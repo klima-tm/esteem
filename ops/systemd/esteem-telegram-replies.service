@@ -1,0 +1,26 @@
+# /etc/systemd/system/esteem-telegram-replies.service
+[Unit]
+Description=Esteem authorized Telegram test replies
+After=network-online.target esteem-telegram.service
+Wants=network-online.target esteem-telegram.service
+
+[Service]
+Type=simple
+WorkingDirectory=/root/projects/esteem/telegram-chip/agent
+ExecStart=/usr/bin/python3 /root/projects/esteem/telegram-chip/agent/bridge.py --config /root/projects/esteem/telegram-chip/agent/config.json
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=15
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/root/projects/esteem/telegram-chip/agent/state /root/.codex
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

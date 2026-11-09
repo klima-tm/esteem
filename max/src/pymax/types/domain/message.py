@@ -1,0 +1,583 @@
+from __future__ import annotations
+
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Annotated, Any, Literal, TypeAlias
+
+from pydantic import Field, PrivateAttr, model_validator
+
+from pymax.files import File, Photo, Video, VideoNote, Voice
+from pymax.types.domain import (
+    AudioAttachment,
+    CallAttachment,
+    ContactAttachment,
+    ControlAttachment,
+    FileAttachment,
+    InlineKeyboardAttachment,
+    PhotoAttachment,
+    Poll,
+    PollAttachment,
+    ShareAttachment,
+    StickerAttachment,
+    UnknownAttachment,
+    VideoAttachment,
+)
+
+from .base import CamelModel
+from .element import Element
+from .enums import AccessType, LinkType, MessageStatus
+
+if TYPE_CHECKING:
+    from pymax.api.messages import DateTimeUnion, MessageService
+
+
+KnownAttachment: TypeAlias = Annotated[
+    PhotoAttachment
+    | VideoAttachment
+    | FileAttachment
+    | ContactAttachment
+    | StickerAttachment
+    | AudioAttachment
+    | ControlAttachment
+    | InlineKeyboardAttachment
+    | ShareAttachment
+    | CallAttachment
+    | PollAttachment,
+    Field(discriminator="type"),
+]
+Attachment: TypeAlias = KnownAttachment | UnknownAttachment
+SendAttachment: TypeAlias = Photo | File | Video | Poll | Voice | VideoNote
+SendAttachments: TypeAlias = Sequence[SendAttachment] | None
+Link: TypeAlias = Annotated["ReplyLink | ForwardLink", Field(discriminator="type")]
+
+
+class MessageLink(CamelModel):
+    message: Message
+    chat_id: int
+
+
+class ReactionCounter(CamelModel):
+    """Счетчик одной реакции на сообщение.
+
+    :ivar count: Количество таких реакций.
+    :vartype count: int
+    :ivar reaction: ID emoji-реакции.
+    :vartype reaction: str
+    """
+
+    count: int
+    reaction: str
+
+
+class ReactionInfo(CamelModel):
+    """Сводная информация о реакциях на сообщение.
+
+    :ivar total_count: Общее количество реакций.
+    :vartype total_count: int
+    :ivar counters: Счетчики по каждому типу реакции.
+    :vartype counters: list[ReactionCounter]
+    :ivar your_reaction: Реакция текущего пользователя, если она есть.
+    :vartype your_reaction: str | None
+    """
+
+    total_count: int = 0
+    counters: list[ReactionCounter] = Field(default_factory=list)
+    your_reaction: str | None = None
+
+
+class ReadState(CamelModel):
+    """Состояние прочтения после отметки сообщения прочитанным.
+
+    :ivar unread: Количество непрочитанных сообщений.
+    :vartype unread: int
+    :ivar mark: Текущая отметка прочтения.
+    :vartype mark: int
+    """
+
+    unread: int
+    mark: int
+
+
+class DelayedAttributes(CamelModel):
+    time_to_fire: int
+    notify_sender: bool
+    notify_opponents: bool
+
+
+class ReplyLink(MessageLink):
+    """Источник сообщения, отправленного как reply.
+
+    :ivar message: Сообщение, на которое ответили.
+    :vartype message: Message
+    :ivar chat_id: ID чата исходного сообщения.
+    :vartype chat_id: int
+    """
+
+    type: Literal[LinkType.REPLY] = LinkType.REPLY
+    message: Message
+    chat_id: int
+
+
+class ForwardLink(MessageLink):
+    """Источник пересланного сообщения.
+
+    Помимо исходного сообщения содержит доступные в payload-е имя, ссылку,
+    тип доступа и иконку исходного чата. Для скрытого источника эти метаданные
+    могут быть ``None``.
+
+    :ivar message: Исходное сообщение.
+    :vartype message: Message
+    :ivar chat_id: ID исходного чата.
+    :vartype chat_id: int
+    """
+
+    type: Literal[LinkType.FORWARD] = LinkType.FORWARD
+    message: Message
+    chat_id: int
+    chat_name: str | None = None
+    chat_link: str | None = None
+    chat_access_type: AccessType | None = None
+    chat_icon_url: str | None = None
+
+
+class Message(CamelModel):
+    """Сообщение Max с методами для действий над ним.
+
+    Сообщения, полученные через клиент, обычно уже привязаны к сервису
+    сообщений. После этого можно вызывать удобные методы объекта:
+    :meth:`reply`, :meth:`answer`, :meth:`forward`, :meth:`edit`, :meth:`pin`,
+    :meth:`delete`, :meth:`read`, :meth:`react`, :meth:`unreact` и
+    :meth:`get_reactions`.
+
+    Используйте ``Message`` в обработчиках ``on_message`` и при работе с
+    историей. Некоторые поля могут быть ``None``, потому что Max присылает
+    разные payload-ы для разных событий.
+
+    Example:
+        .. code-block:: python
+
+           from pymax import Client
+
+           @client.on_message()
+           async def on_message(message: Message, client: Client) -> None:
+               if message.chat_id is None:
+                   return
+
+               await message.answer("Получил сообщение")
+
+    :ivar id: ID сообщения.
+    :vartype id: int
+    :ivar chat_id: ID чата, если он есть в данных сообщения.
+    :vartype chat_id: int | None
+    :ivar post_id: ID поста канала, если сообщение является комментарием.
+    :vartype post_id: int | None
+    :ivar sender: ID отправителя.
+    :vartype sender: int | None
+    :ivar text: Текст сообщения.
+    :vartype text: str
+    :ivar time: Время сообщения в формате Unix time.
+    :vartype time: int
+    :ivar type: Тип сообщения.
+    :vartype type: str
+    :ivar cid: Клиентский ID сообщения, если он есть в payload-е.
+    :vartype cid: int | None
+    :ivar attaches: Вложения сообщения. Неизвестный ``_type`` представлен как
+        ``UnknownAttachment`` с сохраненными дополнительными полями.
+    :vartype attaches: list[Attachment]
+    :ivar stats: Дополнительная статистика сообщения от Max.
+    :vartype stats: dict[str, Any] | None
+    :ivar status: Статус доставки сообщения.
+    :vartype status: MessageStatus | None
+    :ivar reaction_info: Информация о реакциях на сообщение.
+    :vartype reaction_info: ReactionInfo | None
+    :ivar options: Дополнительные параметры сообщения от Max.
+    :vartype options: int | dict[str, Any] | None
+    :ivar prev_message_id: ID предыдущего сообщения.
+    :vartype prev_message_id: int | str | None
+    :ivar ttl: Признак сообщения с ограниченным временем жизни.
+    :vartype ttl: bool | None
+    :ivar unread: Количество непрочитанных сообщений.
+    :vartype unread: int | None
+    :ivar mark: Текущая отметка прочтения.
+    :vartype mark: int | None
+    :ivar elements: Форматированные элементы текста сообщения.
+    :vartype elements: list[Element]
+    :ivar delayed_attributes: Время срабатывания в миллисекундах и настройки
+        уведомлений для отложенного сообщения; ``None`` для обычного.
+    :vartype delayed_attributes: DelayedAttributes | None
+    :ivar link: Исходное сообщение и чат для reply или forward; ``None`` для
+        обычного сообщения без связи.
+    :vartype link: ReplyLink | ForwardLink | None
+    """
+
+    id: int
+    chat_id: int | None = None
+    post_id: int | None = None
+    sender: int | None = None
+    text: str = ""
+    time: int
+    type: str
+    cid: int | None = None
+    attaches: list[Attachment] = Field(default_factory=list)
+    stats: dict[str, Any] | None = None
+    status: MessageStatus | None = None
+    reaction_info: ReactionInfo | None = None
+    options: int | dict[str, Any] | None = None
+    prev_message_id: int | str | None = None
+    ttl: bool | None = None
+    unread: int | None = None
+    mark: int | None = None
+    elements: list[Element] = Field(default_factory=list)
+    delayed_attributes: DelayedAttributes | None = None
+    link: Link | None = None
+
+    _actions: MessageService | None = PrivateAttr(default=None)
+
+    def bind(self, actions: MessageService) -> Message:
+        """Привязывает сервис сообщений к объекту сообщения.
+
+        :param actions: Сервис сообщений для выполнения действий с сообщением.
+        :type actions: MessageService
+        :returns: Это же сообщение с привязанным сервисом.
+        :rtype: Message
+        """
+        self._actions = actions
+        return self
+
+    async def reply(
+        self,
+        text: str | None = None,
+        attachments: SendAttachments = None,
+        *,
+        notify: bool = True,
+        send_at: DateTimeUnion | None = None,
+    ) -> Message:
+        """Отправляет ответ в тот же чат или ветку комментариев.
+
+        :param text: Текст сообщения.
+        :type text: str | None
+        :param attachments: Файлы, фотографии или видео для отправки.
+        :type attachments: SendAttachments
+        :param notify: Отправить ли получателям push-уведомление.
+        :type notify: bool
+        :param send_at: Абсолютный ``datetime``, относительный ``timedelta``
+            или Unix time в секундах. ``None`` и ``0`` отправляют сразу.
+        :type send_at: DateTimeUnion | None
+        :returns: Отправленное сообщение.
+        :rtype: Message
+        :raises RuntimeError: Если сообщение не привязано к сервису или не
+            содержит ``chat_id``.
+        :raises ValueError: Если для комментария задана отложенная отправка.
+        """
+        actions, chat_id = self._bound()
+
+        if self.post_id is not None:
+            if send_at:
+                raise ValueError("Scheduled comments are not supported")
+
+            message = await actions.send_comment(
+                chat_id=chat_id,
+                post_id=self.post_id,
+                text=text,
+                reply_to=self.id,
+                attachments=attachments,
+                notify=notify,
+            )
+            if message.chat_id is None:
+                message.chat_id = chat_id
+            if message.post_id is None:
+                message.post_id = self.post_id
+
+            return message
+
+        return await actions.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_to=self.id,
+            attachments=attachments,
+            notify=notify,
+            send_at=send_at,
+        )
+
+    async def answer(
+        self,
+        text: str | None = None,
+        reply_to: int | None = None,
+        attachments: SendAttachments = None,
+        *,
+        notify: bool = True,
+        send_at: DateTimeUnion | None = None,
+    ) -> Message:
+        """Отправляет сообщение в тот же чат или ветку комментариев.
+
+        :param text: Текст сообщения.
+        :type text: str | None
+        :param reply_to: ID сообщения для ответа.
+        :type reply_to: int | None
+        :param attachments: Файлы, фотографии или видео для отправки.
+        :type attachments: SendAttachments
+        :param notify: Отправить ли получателям push-уведомление.
+        :type notify: bool
+        :param send_at: Абсолютный ``datetime``, относительный ``timedelta``
+            или Unix time в секундах. ``None`` и ``0`` отправляют сразу.
+        :type send_at: DateTimeUnion | None
+        :returns: Отправленное сообщение.
+        :rtype: Message
+        :raises RuntimeError: Если сообщение не привязано к сервису или не
+            содержит ``chat_id``.
+        :raises ValueError: Если для комментария задана отложенная отправка.
+        """
+        actions, chat_id = self._bound()
+
+        if self.post_id is not None:
+            if send_at:
+                raise ValueError("Scheduled comments are not supported")
+
+            message = await actions.send_comment(
+                chat_id=chat_id,
+                post_id=self.post_id,
+                text=text,
+                reply_to=reply_to,
+                attachments=attachments,
+                notify=notify,
+            )
+            if message.chat_id is None:
+                message.chat_id = chat_id
+            if message.post_id is None:
+                message.post_id = self.post_id
+
+            return message
+
+        return await actions.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_to=reply_to,
+            attachments=attachments,
+            notify=notify,
+            send_at=send_at,
+        )
+
+    async def forward(
+        self,
+        chat_id: int,
+        *,
+        notify: bool = True,
+    ) -> Message:
+        """Пересылает это сообщение в другой чат.
+
+        :param chat_id: ID целевого чата.
+        :type chat_id: int
+        :param notify: Отправить ли получателям push-уведомление.
+        :type notify: bool
+        :returns: Пересланное сообщение.
+        :rtype: Message
+        :raises RuntimeError: Если сообщение не привязано к сервису или не
+            содержит ``chat_id``.
+        """
+        actions, source_chat_id = self._bound()
+
+        return await actions.forward_message(
+            chat_id=chat_id,
+            message_id=self.id,
+            source_chat_id=source_chat_id,
+            notify=notify,
+        )
+
+    async def pin(self, notify_pin: bool = True) -> bool:
+        """Закрепляет это сообщение в чате.
+
+        :param notify_pin: Отправить ли уведомление о закреплении.
+        :type notify_pin: bool
+        :returns: ``True``, если сервер принял запрос.
+        :rtype: bool
+        :raises RuntimeError: Если сообщение не привязано к сервису или не
+            содержит ``chat_id``.
+        """
+        actions, chat_id = self._bound()
+
+        return await actions.pin_message(
+            chat_id=chat_id,
+            message_id=self.id,
+            notify_pin=notify_pin,
+        )
+
+    async def edit(
+        self,
+        text: str | None = None,
+        attachments: SendAttachments = None,
+    ) -> Message:
+        """Редактирует текст и вложения этого сообщения.
+
+        :param text: Новый текст сообщения с поддержкой markdown.
+        :type text: str | None
+        :param attachments: Новые файлы, фотографии или видео для сообщения.
+        :type attachments: SendAttachments
+        :returns: Отредактированное сообщение.
+        :rtype: Message
+        :raises RuntimeError: Если сообщение не привязано к сервису или не
+            содержит ``chat_id``.
+        """
+        actions, chat_id = self._bound()
+
+        if self.post_id is not None:
+            message = await actions.edit_comment(
+                chat_id=chat_id,
+                post_id=self.post_id,
+                message_id=self.id,
+                text=text,
+                attachments=attachments,
+            )
+            if message.chat_id is None:
+                message.chat_id = chat_id
+            if message.post_id is None:
+                message.post_id = self.post_id
+
+            return message
+
+        return await actions.edit_message(
+            chat_id=chat_id,
+            message_id=self.id,
+            text=text,
+            attachments=attachments,
+        )
+
+    async def delete(self, for_me: bool = False) -> bool:
+        """Удаляет это сообщение.
+
+        :param for_me: Удалить сообщение только для текущего аккаунта.
+        :type for_me: bool
+        :returns: ``True``, если сервер принял запрос.
+        :rtype: bool
+        :raises RuntimeError: Если сообщение не привязано к сервису или не
+            содержит ``chat_id``.
+        """
+        actions, chat_id = self._bound()
+
+        if self.post_id is not None:
+            return await actions.delete_comment(
+                chat_id=chat_id,
+                post_id=self.post_id,
+                message_ids=[self.id],
+                for_me=for_me,
+            )
+
+        return await actions.delete_message(
+            chat_id=chat_id,
+            message_ids=[self.id],
+            for_me=for_me,
+        )
+
+    async def read(self) -> ReadState:
+        """Отмечает это сообщение как прочитанное.
+
+        :returns: Состояние прочтения.
+        :rtype: ReadState
+        :raises RuntimeError: Если сообщение не привязано к сервису или не
+            содержит ``chat_id``.
+        """
+        actions, chat_id = self._bound()
+
+        return await actions.read_message(
+            message_id=self.id,
+            chat_id=chat_id,
+        )
+
+    async def react(self, reaction: str) -> ReactionInfo | None:
+        """Добавляет или заменяет свою реакцию на этом сообщении.
+
+        :param reaction: ID emoji-реакции, поддержанный сервером.
+        :type reaction: str
+        :returns: Обновленные реакции или ``None``, если сервер их не вернул.
+        :rtype: ReactionInfo | None
+        :raises RuntimeError: Если сообщение не привязано к сервису или не
+            содержит ``chat_id``.
+        """
+        actions, chat_id = self._bound()
+
+        if self.post_id is not None:
+            return await actions.add_comment_reaction(
+                chat_id=chat_id,
+                post_id=self.post_id,
+                message_id=self.id,
+                reaction=reaction,
+            )
+
+        return await actions.add_reaction(
+            chat_id=chat_id,
+            message_id=self.id,
+            reaction=reaction,
+        )
+
+    async def unreact(self) -> ReactionInfo | None:
+        """Удаляет свою реакцию с этого сообщения.
+
+        :returns: Обновленные реакции или ``None``, если сервер их не вернул.
+        :rtype: ReactionInfo | None
+        :raises RuntimeError: Если сообщение не привязано к сервису или не
+            содержит ``chat_id``.
+        """
+        actions, chat_id = self._bound()
+
+        if self.post_id is not None:
+            return await actions.remove_comment_reaction(
+                chat_id=chat_id,
+                post_id=self.post_id,
+                message_id=self.id,
+            )
+
+        return await actions.remove_reaction(
+            chat_id=chat_id,
+            message_id=self.id,
+        )
+
+    async def get_reactions(self) -> dict[str, ReactionInfo] | None:
+        """Возвращает реакции для этого сообщения.
+
+        :returns: ``{message_id: ReactionInfo}`` или ``None``, если реакций
+            нет в ответе сервера.
+        :rtype: dict[str, ReactionInfo] | None
+        :raises RuntimeError: Если сообщение не привязано к сервису или не
+            содержит ``chat_id``.
+        """
+        actions, chat_id = self._bound()
+
+        return await actions.get_reactions(
+            chat_id=chat_id,
+            message_ids=[self.id],
+        )
+
+    def _bound(self) -> tuple[MessageService, int]:
+        if self._actions is None:
+            raise RuntimeError("Message is not bound to a client.")
+
+        if self.chat_id is None:
+            raise RuntimeError("Message does not contain chat_id.")
+
+        return self._actions, self.chat_id
+
+    @model_validator(mode="before")
+    @classmethod
+    def _unwrap_message_event(cls, value: Any) -> Any:
+        """Преобразует данные события сообщения в данные сообщения.
+
+        :param value: Значение, переданное в валидатор модели.
+        :type value: Any
+        :returns: Данные сообщения или исходное значение, если преобразование
+            не требуется.
+        :rtype: Any
+        """
+        if not isinstance(value, dict):
+            return value
+
+        message = value.get("message")
+        if not isinstance(message, dict):
+            return value
+
+        return {
+            **message,
+            "chatId": value.get("chatId"),
+            "postId": value.get("postId"),
+            "prevMessageId": value.get("prevMessageId"),
+            "ttl": value.get("ttl"),
+            "unread": value.get("unread"),
+            "mark": value.get("mark"),
+        }

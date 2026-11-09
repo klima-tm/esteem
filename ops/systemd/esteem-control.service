@@ -1,0 +1,19 @@
+# /etc/systemd/system/esteem-control.service
+[Unit]
+Description=Esteem owner first-contact broker
+Wants=network-online.target
+After=network-online.target esteem-telegram.service
+[Service]
+Type=simple
+WorkingDirectory=/root/projects/esteem/control
+ExecStart=/usr/bin/python3 /root/projects/esteem/control/server.py
+UMask=0077
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/root/projects/esteem
+[Install]
+WantedBy=multi-user.target

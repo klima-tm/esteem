@@ -1,0 +1,18 @@
+{
+  "model": "gpt-5.6-sol",
+  "codex_bin": "/usr/bin/codex",
+  "model_timeout_seconds": 120,
+  "memory_file": "/root/projects/esteem/AGENT.md",
+  "workspace": "/root/projects/esteem/max/reply-workspace",
+  "state_db": "/root/projects/esteem/max/state/conversations.sqlite3",
+  "reply_engine": "/root/projects/esteem/telegram-chip/agent/bridge.py",
+  "expected_sender_id": 0,
+  "activated_at": 0,
+  "allowed_contacts": [
+    {
+      "phone": "+12025550123",
+      "user_id": 0,
+      "chat_id": 0
+    }
+  ]
+}

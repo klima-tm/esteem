@@ -1,0 +1,29 @@
+# /etc/systemd/system/esteem-telegram.service
+[Unit]
+Description=Esteem Telegram Chip API
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
+ConditionPathExists=/root/projects/esteem/telegram-chip/test-account.session
+
+[Service]
+Type=simple
+WorkingDirectory=/root/projects/esteem/telegram-chip
+ExecStart=/root/projects/esteem/telegram-chip/.venv/bin/python api.py
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/root/projects/esteem/telegram-chip
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

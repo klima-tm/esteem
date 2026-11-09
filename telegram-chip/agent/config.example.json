@@ -1,0 +1,19 @@
+{
+  "chip_url": "http://127.0.0.1:8080",
+  "expected_sender_id": 0,
+  "allowed_chats": [
+    {
+      "chat_id": 0,
+      "phone": "+12025550123"
+    }
+  ],
+  "model": "gpt-5.6-sol",
+  "codex_bin": "/usr/bin/codex",
+  "workspace": "/root/projects/esteem/telegram-chip/agent/workspace",
+  "memory_file": "/root/projects/esteem/AGENT.md",
+  "state_db": "/root/projects/esteem/telegram-chip/agent/state/conversations.sqlite3",
+  "model_timeout_seconds": 120,
+  "poll_seconds": 3,
+  "owner_id": 0,
+  "control_token_file": "/root/projects/esteem/control/token"
+}

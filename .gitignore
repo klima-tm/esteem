@@ -1,0 +1,67 @@
+# Credentials, sessions and private state
+.env
+.env.*
+!.env.example
+sandbox.env
+auth.json
+auth.lock
+**/access-token
+**/token
+**/public-url
+*.db
+*.db-*
+*.sqlite*
+*.session*
+*.log
+*.lock
+!package-lock.json
+!uv.lock
+**/session/
+**/sessions/
+**/state/
+**/cache/
+**/backups/
+/migration-backup/
+/migration.json
+/OPERATIONS.local.md
+*.png
+*.jpg
+*.jpeg
+*.tar.gz
+*.zip
+._*
+.DS_Store
+__pycache__/
+*.py[cod]
+.venv/
+node_modules/
+# Deployment-specific configuration and receipts
+/telegram-chip/agent/config.json
+/telegram-chip/agent/MEMORY.md
+/telegram-chip/agent/workspace/
+/telegram-chip/first-contact-test-result.json
+/max/auto_reply.json
+/max/reply-workspace/
+/test-form/record-only-check.json
+/test-form/bin/
+/bitrix/config.json
+/bitrix/sandbox-config.json
+/bitrix/production-config.ARCHIVED.json
+/bitrix/crm.*.json
+/bitrix/setup_test_crm.py
+/profiles/**/*.json
+!/profiles/**/*.example.json
+# Hermes is an external runtime: only templates and isolated bridge source belong here.
+/hermes/*
+!/hermes/config.example.yaml
+!/hermes/.env.example
+!/hermes/SOUL.md
+!/hermes/scripts/
+/hermes/scripts/*
+!/hermes/scripts/whatsapp-bridge/
+# Stale service definitions from the pre-Esteem test setup
+/telegram-chip/telegram-chip-test.service
+/telegram-chip/agent/telegram-chip-ai-test.service
+
+# Upstream CI templates are not Esteem CI.
+/max/.github/

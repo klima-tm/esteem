@@ -1,0 +1,23 @@
+# /etc/systemd/system/esteem-hermes.service
+[Unit]
+Description=Esteem Hermes WhatsApp gateway
+Wants=network-online.target
+After=network-online.target
+[Service]
+Type=simple
+WorkingDirectory=/root/projects/esteem/hermes
+Environment=HOME=/root/projects/esteem/hermes
+Environment=HERMES_HOME=/root/projects/esteem/hermes
+Environment=HERMES_SUPERVISED_CHILD=1
+EnvironmentFile=/root/projects/esteem/hermes/.env
+ExecStart=/usr/local/lib/hermes-agent-production/venv/bin/hermes gateway run
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=90
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/root/projects/esteem
+[Install]
+WantedBy=multi-user.target

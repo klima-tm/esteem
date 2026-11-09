@@ -1,0 +1,40 @@
+platforms:
+  whatsapp:
+    enabled: true
+    extra:
+      bridge_port: 3011
+model:
+  default: gpt-5.6-sol
+  provider: openai-codex
+agent:
+  reasoning_effort: high
+  environment_probe: false
+plugins:
+  enabled: []
+mcp_servers: {}
+platform_toolsets:
+  cli:
+  - memory
+  - session_search
+  whatsapp:
+  - memory
+  - session_search
+memory:
+  memory_enabled: true
+  user_profile_enabled: false
+terminal:
+  cwd: /root/projects/esteem/hermes/workspace
+auxiliary:
+  background_review:
+    enabled: false
+whatsapp:
+  unauthorized_dm_behavior: ignore
+  reply_prefix: ''
+display:
+  platforms:
+    whatsapp:
+      tool_progress: 'off'
+      thinking_progress: false
+      show_reasoning: false
+compression:
+  enabled: true

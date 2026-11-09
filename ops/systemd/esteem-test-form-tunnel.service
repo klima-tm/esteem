@@ -1,0 +1,15 @@
+# /etc/systemd/system/esteem-test-form-tunnel.service
+[Unit]
+Description=Temporary HTTPS access for Esteem sandbox test form
+Wants=network-online.target esteem-test-form.service
+After=network-online.target esteem-test-form.service
+[Service]
+ExecStart=/root/projects/esteem/test-form/bin/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:3020 --protocol http2
+Restart=on-failure
+RestartSec=15
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+[Install]
+WantedBy=multi-user.target

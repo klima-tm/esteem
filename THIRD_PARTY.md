@@ -1,0 +1,7 @@
+# Third-party components
+
+- Telegram Chip: https://github.com/qwwiwi/agentos-skills-public, source baseline `490ed51c443978779657157a1d258f00df77e3a6`, component `skills/telegram-chip`. Modified locally. Apache-2.0 license and NOTICE retained under `telegram-chip/`.
+- PyMax: https://github.com/MaxApiTeam/PyMax, vendored baseline `c4cb917d354a1179be625925530d72c8aaa969ff`. MIT license retained under `max/`. Local connector/reply files are additions. Original nested Git metadata is preserved privately in migration backups, not published as a submodule.
+- Hermes: https://github.com/NousResearch/hermes-agent, externally installed deployment checkout `29112bef099274229cadff79cdff7bf7b99c4b77` (may contain deployment-specific modifications). Only the profile WhatsApp bridge is vendored here; its MIT license is `hermes/scripts/whatsapp-bridge/LICENSE.hermes`. The rest of the runtime is a separately installed dependency.
+- Baileys: `@whiskeysockets/baileys` 7.0.0-rc13, installed through package-lock.json. `ops/patch_baileys_pairing.py` ports upstream PRs #2765 (`4f263f0e365c2e74dd1b824031d1c5910f518c26`) and #2749 (`38686677889a4db5356da51aa9517eb12c1e0866`). Dependencies remain under their own licenses.
+- Cloudflared: external binary, not included. Deployment used official version 2026.10.7, linux-amd64 SHA256 `1f99fb518b83dec2ba8d870a7cc991d82a77e6196295a3d2754ba17ab9f91872`. Obtain it from https://github.com/cloudflare/cloudflared/releases .

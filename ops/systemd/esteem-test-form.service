@@ -1,0 +1,19 @@
+# /etc/systemd/system/esteem-test-form.service
+[Unit]
+Description=Esteem sandbox test form and lead workflow
+Wants=network-online.target
+After=network-online.target esteem-telegram.service esteem-max.service esteem-hermes.service
+[Service]
+Type=simple
+WorkingDirectory=/root/projects/esteem/test-form
+ExecStart=/usr/bin/python3 /root/projects/esteem/test-form/app.py
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/root/projects/esteem /root/.codex
+[Install]
+WantedBy=multi-user.target

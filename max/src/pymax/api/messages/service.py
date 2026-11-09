@@ -1,0 +1,866 @@
+from __future__ import annotations
+
+import asyncio
+import time
+from collections.abc import Sequence
+from datetime import datetime, timedelta
+from typing import TYPE_CHECKING, TypeAlias, TypeVar
+
+from pymax.api.binding import bind_api_model, bind_api_models
+from pymax.api.response import (
+    parse_payload_list,
+    parse_payload_model,
+    payload_item,
+    require_payload_item_model,
+    require_payload_model,
+)
+from pymax.api.uploads.payloads import (
+    AttachFilePayload,
+    AttachPhotoPayload,
+    VideoAttachPayload,
+    VideoNoteAttachPayload,
+    VoiceAttachPayload,
+)
+from pymax.exceptions import ApiError, UploadError
+from pymax.files import File, Photo, Video, VideoNote, Voice
+from pymax.formatting.markdown import Formatter
+from pymax.logging import get_logger
+from pymax.protocol import Opcode
+from pymax.types.domain import (
+    CommentsInfoUpdate,
+    FileRequest,
+    Message,
+    Poll,
+    PollState,
+    ReactionInfo,
+    ReadState,
+    VideoRequest,
+)
+
+from .enums import ItemType, MessagePayloadKey, ReadAction
+from .payloads import (
+    AddCommentReactionPayload,
+    AddReactionPayload,
+    ChatHistoryPayload,
+    CommentsHistoryPayload,
+    DelayedAttributes,
+    DeleteCommentPayload,
+    DeleteMessagePayload,
+    DeleteUserCommentsPayload,
+    EditCommentPayload,
+    EditMessagePayload,
+    ForwardLink,
+    ForwardMessagePayload,
+    ForwardMessagePayloadMessage,
+    GetCommentsInfoPayload,
+    GetCommentsPayload,
+    GetFilePayload,
+    GetMessagesPayload,
+    GetReactionsPayload,
+    GetVideoPayload,
+    PinMessagePayload,
+    ReactionInfoPayload,
+    ReadMessagesPayload,
+    RemoveCommentReactionPayload,
+    RemoveReactionPayload,
+    ReplyLink,
+    SendCommentPayload,
+    SendMessagePayload,
+    SendMessagePayloadMessage,
+    SubscribeCommentsPayload,
+    VotePollPayload,
+)
+
+if TYPE_CHECKING:
+    from pymax.app import App
+
+SendAttachment: TypeAlias = Photo | File | Video | Poll | Voice | VideoNote
+SendAttachments: TypeAlias = Sequence[SendAttachment] | None
+DateTimeUnion: TypeAlias = datetime | timedelta | int
+
+T = TypeVar("T")
+
+logger = get_logger(__name__)
+
+
+class MessageService:
+    def __init__(self, app: App) -> None:
+        self.app = app
+
+        self._prev = int(time.time() * 1000)
+
+    def _next_cid(self) -> int:
+        now = int(time.time() * 1000)
+        e = max(now, self._prev + 1)
+        self._prev = e
+        logger.debug("generated message cid=%s", e)
+        return e
+
+    async def _prepare_message(
+        self,
+        text: str | None,
+        reply_to: int | None,
+        attachments: SendAttachments,
+        *,
+        delayed_attributes: DelayedAttributes | None = None,
+    ) -> tuple[
+        SendMessagePayloadMessage,
+        list[
+            AttachPhotoPayload | VideoAttachPayload | AttachFilePayload | VoiceAttachPayload | Poll
+        ],
+    ]:
+        if not text and not attachments:
+            raise ValueError("Either text or attachments must be provided")
+
+        if text:
+            clean_text, elements = Formatter.format_markdown(text)
+        else:
+            clean_text, elements = None, []
+
+        attaches = await self._upload_attachments(attachments)
+
+        message = SendMessagePayloadMessage(
+            text=clean_text,
+            cid=self._next_cid(),
+            elements=elements,
+            attaches=attaches,
+            link=ReplyLink(message_id=reply_to) if reply_to else None,
+            delayed_attributes=delayed_attributes,
+        )
+
+        return message, attaches
+
+    async def _upload_attachments(
+        self, attachments: SendAttachments
+    ) -> list[
+        AttachPhotoPayload | VideoAttachPayload | AttachFilePayload | VoiceAttachPayload | Poll
+    ]:  # TODO: TypeAlias
+        result: list[
+            AttachPhotoPayload | VideoAttachPayload | AttachFilePayload | VoiceAttachPayload | Poll
+        ] = []
+        if not attachments:
+            return result
+
+        for attachment in attachments:
+            if isinstance(attachment, Voice):
+                upload_result = await self.app.api.uploads.upload_voice(attachment)
+                if not upload_result:
+                    logger.error("Voice uploading failed")
+                    raise UploadError("Voice uploading failed")
+
+                result.append(upload_result)
+
+            elif isinstance(attachment, Photo):
+                upload_result = await self.app.api.uploads.upload_photo(attachment)
+                if not upload_result:
+                    logger.error("Photo uploading failed")
+                    raise UploadError("Photo uploading failed")
+
+                result.append(upload_result)
+
+            elif isinstance(attachment, (Video, VideoNote)):
+                upload_result = await self.app.api.uploads.upload_video(attachment)
+                if not upload_result:
+                    logger.error("Video uploading failed")
+                    raise UploadError("Video uploading failed")
+
+                result.append(upload_result)
+
+            elif isinstance(attachment, File):
+                upload_result = await self.app.api.uploads.upload_file(attachment)
+                if not upload_result:
+                    logger.error("File uploading failed")
+                    raise UploadError("File uploading failed")
+
+                result.append(upload_result)
+
+            elif isinstance(attachment, Poll):
+                result.append(attachment)
+
+        return result
+
+    def _convert_time(self, time: DateTimeUnion) -> int:
+        if isinstance(time, datetime):
+            return int(time.timestamp() * 1000)
+
+        if isinstance(time, timedelta):
+            return int((datetime.now() + time).timestamp() * 1000)
+
+        return time * 1000
+
+    async def _wait_for_upload_signal(
+        self,
+        waiters: dict[int, asyncio.Future[T]],
+        video_id: int,
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[T] = loop.create_future()
+
+        waiters[video_id] = future
+        try:
+            await asyncio.wait_for(future, timeout=60)
+        except TimeoutError:
+            logger.warning(
+                "Timed out waiting for video processing notification video_id=%s",
+                video_id,
+            )
+            raise UploadError(f"Timed out waiting for video processing video_id={video_id}")
+        finally:
+            waiters.pop(video_id, None)
+
+    async def _process_attachment_error(
+        self,
+        attaches: list[
+            AttachPhotoPayload | VideoAttachPayload | AttachFilePayload | VoiceAttachPayload | Poll
+        ],
+    ):
+        attachment: VoiceAttachPayload | VideoNoteAttachPayload | None = None
+        for attach in attaches:
+            if isinstance(attach, (VoiceAttachPayload, VideoNoteAttachPayload)):
+                attachment = attach
+                break
+
+        if attachment is None:
+            raise ValueError(
+                "Unexpected internal state: Non voice/video_note attach is not ready. "
+                + "Please, report that issue"
+            )
+
+        if isinstance(attachment, VoiceAttachPayload):
+            await self._wait_for_upload_signal(
+                self.app.api.uploads.voice_upload_waiters, attachment.video_id
+            )
+        else:
+            await self._wait_for_upload_signal(
+                self.app.api.uploads.video_upload_waiters, attachment.video_id
+            )
+
+    async def send_message(
+        self,
+        chat_id: int,
+        text: str | None = None,
+        reply_to: int | None = None,
+        attachments: SendAttachments = None,
+        *,
+        notify: bool = True,
+        send_at: DateTimeUnion | None = None,
+    ) -> Message:
+        logger.info("sending message chat_id=%s text_len=%s", chat_id, len(text) if text else 0)
+
+        message, attaches = await self._prepare_message(
+            text,
+            reply_to,
+            attachments,
+            delayed_attributes=DelayedAttributes(
+                time_to_fire=self._convert_time(send_at),
+                notify_sender=notify,
+            )
+            if send_at
+            else None,
+        )
+
+        frame = SendMessagePayload(
+            chat_id=chat_id,
+            message=message,
+            notify=notify,
+        )
+
+        try:
+            response = await self.app.invoke(Opcode.MSG_SEND, frame.to_payload())
+        except ApiError as e:
+            if e.error == "attachment.not.ready":
+                await self._process_attachment_error(attaches)
+                response = await self.app.invoke(Opcode.MSG_SEND, frame.to_payload())
+            else:
+                raise
+
+        message = bind_api_model(
+            self.app,
+            require_payload_model(response, Message),
+        )
+        logger.info("message sent chat_id=%s", chat_id)
+        return message
+
+    async def forward_message(
+        self,
+        chat_id: int,
+        message_id: int | str,
+        source_chat_id: int | None = None,
+        *,
+        notify: bool = True,
+    ) -> Message:
+        source_chat_id = chat_id if source_chat_id is None else source_chat_id
+        logger.info(
+            "forwarding message source_chat_id=%s chat_id=%s message_id=%s",
+            source_chat_id,
+            chat_id,
+            message_id,
+        )
+
+        frame = ForwardMessagePayload(
+            chat_id=chat_id,
+            message=ForwardMessagePayloadMessage(
+                cid=-self._next_cid(),
+                link=ForwardLink(
+                    message_id=str(message_id),
+                    chat_id=source_chat_id,
+                ),
+            ),
+            notify=notify,
+        )
+
+        response = await self.app.invoke(Opcode.MSG_SEND, frame.to_payload())
+        message = bind_api_model(
+            self.app,
+            require_payload_model(response, Message),
+        )
+        logger.info("message forwarded source_chat_id=%s chat_id=%s", source_chat_id, chat_id)
+        return message
+
+    async def get_messages(
+        self,
+        chat_id: int,
+        message_ids: list[int],
+    ) -> list[Message]:
+        frame = GetMessagesPayload(
+            chat_id=chat_id,
+            message_ids=message_ids,
+        )
+
+        response = await self.app.invoke(Opcode.MSG_GET, frame.to_payload())
+        messages = parse_payload_list(response, MessagePayloadKey.MESSAGES, Message)
+        for message in messages:
+            if message.chat_id is None:
+                message.chat_id = chat_id
+
+        return bind_api_models(self.app, messages)
+
+    async def get_message(
+        self,
+        chat_id: int,
+        message_id: int,
+    ) -> Message | None:
+        messages = await self.get_messages(chat_id, [message_id])
+        return messages[0] if messages else None
+
+    async def edit_message(
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str | None = None,
+        attachments: SendAttachments = None,
+    ) -> Message:
+        if not text and not attachments:
+            logger.error("edit_message failed: no text or attachments provided")
+            raise ValueError("Either text or attachments must be provided")
+
+        if text:
+            clean_text, elements = Formatter.format_markdown(text)
+        else:
+            clean_text, elements = None, []
+
+        attaches = await self._upload_attachments(attachments)
+
+        frame = EditMessagePayload(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=clean_text,
+            elements=elements,
+            attachments=attaches,
+        )
+        try:
+            response = await self.app.invoke(Opcode.MSG_EDIT, frame.to_payload())
+        except ApiError as e:
+            if e.error == "attachment.not.ready":
+                await self._process_attachment_error(attaches)
+
+                response = await self.app.invoke(Opcode.MSG_EDIT, frame.to_payload())
+            else:
+                raise
+
+        message = require_payload_item_model(
+            response,
+            MessagePayloadKey.MESSAGE,
+            Message,
+        )
+        if message.chat_id is None:
+            message.chat_id = chat_id
+
+        return bind_api_model(self.app, message)
+
+    async def fetch_history(
+        self,
+        chat_id: int,
+        forward: int = 0,
+        backward: int = 40,
+        backward_time: int = 0,
+        forward_time: int = 0,
+        from_: int | None = None,
+        item_type: ItemType = ItemType.REGULAR,
+        get_chat: bool = False,
+        get_messages: bool = True,
+        interactive: bool = False,
+    ) -> list[Message]:
+        frame = ChatHistoryPayload(
+            chat_id=chat_id,
+            forward=forward,
+            backward=backward,
+            backward_time=backward_time,
+            forward_time=forward_time,
+            from_=from_ or int(time.time() * 1000),
+            item_type=item_type,
+            get_chat=get_chat,
+            get_messages=get_messages,
+            interactive=interactive,
+        )
+
+        response = await self.app.invoke(
+            Opcode.CHAT_HISTORY,
+            payload=frame.to_payload(),
+        )
+        messages = bind_api_models(
+            self.app,
+            parse_payload_list(response, MessagePayloadKey.MESSAGES, Message),
+        )
+        return messages
+
+    async def fetch_comments(
+        self,
+        chat_id: int,
+        post_id: int,
+        from_: int | None = None,
+        backward: int = 30,
+        get_messages: bool = True,
+        forward: int = 0,
+    ) -> list[Message]:
+        frame = CommentsHistoryPayload(
+            chat_id=chat_id,
+            forward=forward,
+            backward=backward,
+            post_id=post_id,
+            from_=-1 if from_ is None else from_,
+            get_messages=get_messages,
+        )
+        response = await self.app.invoke(
+            Opcode.CHAT_HISTORY,
+            payload=frame.to_payload(),
+        )
+        messages = bind_api_models(
+            self.app,
+            parse_payload_list(response, MessagePayloadKey.MESSAGES, Message),
+        )
+        return messages
+
+    async def delete_message(
+        self,
+        chat_id: int,
+        message_ids: list[int],
+        for_me: bool,
+    ) -> bool:
+        logger.info(
+            "deleting messages chat_id=%s ids=%s for_me=%s",
+            chat_id,
+            message_ids,
+            for_me,
+        )
+        frame = DeleteMessagePayload(
+            chat_id=chat_id,
+            message_ids=message_ids,
+            for_me=for_me,
+        )
+
+        await self.app.invoke(Opcode.MSG_DELETE, frame.to_payload())
+        logger.info("messages deleted chat_id=%s count=%s", chat_id, len(message_ids))
+        return True
+
+    async def pin_message(
+        self,
+        chat_id: int,
+        message_id: int,
+        notify_pin: bool,
+    ) -> bool:
+        logger.info(
+            "pinning message chat_id=%s message_id=%s notify_pin=%s",
+            chat_id,
+            message_id,
+            notify_pin,
+        )
+        frame = PinMessagePayload(
+            chat_id=chat_id,
+            notify_pin=notify_pin,
+            pin_message_id=message_id,
+        )
+
+        await self.app.invoke(Opcode.CHAT_UPDATE, frame.to_payload())
+        logger.info("message pinned chat_id=%s message_id=%s", chat_id, message_id)
+        return True
+
+    async def get_video_by_id(
+        self,
+        chat_id: int,
+        message_id: int | str,
+        video_id: int,
+    ) -> VideoRequest | None:
+        logger.info(
+            "getting video chat_id=%s message_id=%s video_id=%s",
+            chat_id,
+            message_id,
+            video_id,
+        )
+        frame = GetVideoPayload(
+            chat_id=chat_id,
+            message_id=message_id,
+            video_id=video_id,
+        )
+
+        response = await self.app.invoke(Opcode.VIDEO_PLAY, frame.to_payload())
+        return parse_payload_model(response, VideoRequest)
+
+    async def get_file_by_id(
+        self,
+        chat_id: int,
+        message_id: int | str,
+        file_id: int,
+    ) -> FileRequest | None:
+        logger.info(
+            "getting file chat_id=%s message_id=%s file_id=%s",
+            chat_id,
+            message_id,
+            file_id,
+        )
+        frame = GetFilePayload(
+            chat_id=chat_id,
+            message_id=message_id,
+            file_id=file_id,
+        )
+
+        response = await self.app.invoke(Opcode.FILE_DOWNLOAD, frame.to_payload())
+        return parse_payload_model(response, FileRequest)
+
+    async def add_reaction(
+        self,
+        chat_id: int,
+        message_id: int,
+        reaction: str,
+    ) -> ReactionInfo | None:
+        logger.info(
+            "adding reaction chat_id=%s message_id=%s reaction=%s",
+            chat_id,
+            message_id,
+            reaction,
+        )
+        frame = AddReactionPayload(
+            chat_id=chat_id,
+            message_id=message_id,
+            reaction=ReactionInfoPayload(id=reaction),
+        )
+
+        response = await self.app.invoke(Opcode.MSG_REACTION, frame.to_payload())
+        reaction_info = payload_item(response, MessagePayloadKey.REACTION_INFO)
+        if reaction_info:
+            return ReactionInfo.model_validate(reaction_info)
+
+        return None
+
+    async def get_reactions(
+        self,
+        chat_id: int,
+        message_ids: list[int],
+    ) -> dict[str, ReactionInfo] | None:
+        logger.info(
+            "getting reactions chat_id=%s message_ids=%s",
+            chat_id,
+            message_ids,
+        )
+        frame = GetReactionsPayload(chat_id=chat_id, message_ids=message_ids)
+
+        response = await self.app.invoke(
+            Opcode.MSG_GET_REACTIONS,
+            frame.to_payload(),
+        )
+        messages_reactions = payload_item(
+            response,
+            MessagePayloadKey.MESSAGES_REACTIONS,
+        )
+        if messages_reactions is None:
+            return None
+
+        return {
+            message_id: ReactionInfo.model_validate(reaction_data)
+            for message_id, reaction_data in messages_reactions.items()
+        }
+
+    async def remove_reaction(
+        self,
+        chat_id: int,
+        message_id: int,
+    ) -> ReactionInfo | None:
+        logger.info(
+            "removing reaction chat_id=%s message_id=%s",
+            chat_id,
+            message_id,
+        )
+        frame = RemoveReactionPayload(chat_id=chat_id, message_id=message_id)
+
+        response = await self.app.invoke(
+            Opcode.MSG_CANCEL_REACTION,
+            frame.to_payload(),
+        )
+        reaction_info = payload_item(response, MessagePayloadKey.REACTION_INFO)
+        if reaction_info:
+            return ReactionInfo.model_validate(reaction_info)
+
+        return None
+
+    async def read_message(self, message_id: int, chat_id: int) -> ReadState:
+        logger.info(
+            "marking message as read chat_id=%s message_id=%s",
+            chat_id,
+            message_id,
+        )
+        frame = ReadMessagesPayload(
+            type=ReadAction.READ_MESSAGE,
+            chat_id=chat_id,
+            message_id=message_id,
+            mark=int(time.time() * 1000),
+        )
+
+        response = await self.app.invoke(Opcode.CHAT_MARK, frame.to_payload())
+        return require_payload_model(response, ReadState)
+
+    async def vote_poll(
+        self,
+        chat_id: int,
+        message_id: int,
+        poll_id: int,
+        answer_ids: list[int],
+    ) -> PollState:
+        frame = VotePollPayload(
+            chat_id=chat_id, message_id=message_id, poll_id=poll_id, answers_ids=answer_ids
+        )
+        response = await self.app.invoke(Opcode.SEND_VOTE, frame.to_payload())
+
+        return require_payload_item_model(response, "state", PollState)
+
+    async def send_comment(
+        self,
+        chat_id: int,
+        post_id: int,
+        text: str | None = None,
+        reply_to: int | None = None,
+        attachments: SendAttachments = None,
+        *,
+        notify: bool = True,
+    ) -> Message:
+        message, attaches = await self._prepare_message(text, reply_to, attachments)
+
+        frame = SendCommentPayload(
+            chat_id=chat_id,
+            post_id=post_id,
+            notify=notify,
+            message=message,
+        )
+
+        try:
+            response = await self.app.invoke(Opcode.MSG_SEND, frame.to_payload())
+        except ApiError as e:
+            if e.error == "attachment.not.ready":
+                await self._process_attachment_error(attaches)
+                response = await self.app.invoke(Opcode.MSG_SEND, frame.to_payload())
+            else:
+                raise
+
+        return bind_api_model(
+            self.app,
+            require_payload_model(response, Message),
+        )
+
+    async def get_comments(
+        self,
+        chat_id: int,
+        post_id: int,
+        message_ids: list[int],
+    ) -> list[Message]:
+        frame = GetCommentsPayload(
+            chat_id=chat_id,
+            post_id=post_id,
+            message_ids=message_ids,
+        )
+
+        response = await self.app.invoke(Opcode.MSG_GET, frame.to_payload())
+        messages = parse_payload_list(response, MessagePayloadKey.MESSAGES, Message)
+        for message in messages:
+            if message.chat_id is None:
+                message.chat_id = chat_id
+
+        return bind_api_models(self.app, messages)
+
+    async def get_comment(
+        self,
+        chat_id: int,
+        post_id: int,
+        message_id: int,
+    ) -> Message | None:
+        messages = await self.get_comments(chat_id, post_id, [message_id])
+        return messages[0] if messages else None
+
+    async def edit_comment(
+        self,
+        chat_id: int,
+        post_id: int,
+        message_id: int,
+        text: str | None = None,
+        attachments: SendAttachments = None,
+    ) -> Message:
+        if not text and not attachments:
+            logger.error("edit_comment failed: no text or attachments provided")
+            raise ValueError("Either text or attachments must be provided")
+
+        if text:
+            clean_text, elements = Formatter.format_markdown(text)
+        else:
+            clean_text, elements = None, []
+
+        attaches = await self._upload_attachments(attachments)
+
+        frame = EditCommentPayload(
+            chat_id=chat_id,
+            post_id=post_id,
+            message_id=message_id,
+            text=clean_text,
+            elements=elements,
+            attachments=attaches,
+        )
+        try:
+            response = await self.app.invoke(Opcode.MSG_EDIT, frame.to_payload())
+        except ApiError as e:
+            if e.error == "attachment.not.ready":
+                await self._process_attachment_error(attaches)
+
+                response = await self.app.invoke(Opcode.MSG_EDIT, frame.to_payload())
+            else:
+                raise
+
+        message = require_payload_item_model(
+            response,
+            MessagePayloadKey.MESSAGE,
+            Message,
+        )
+        if message.chat_id is None:
+            message.chat_id = chat_id
+
+        return bind_api_model(self.app, message)
+
+    async def delete_comment(
+        self,
+        chat_id: int,
+        post_id: int,
+        message_ids: list[int],
+        for_me: bool = False,
+    ) -> bool:
+        logger.info(
+            "deleting messages chat_id=%s ids=%s for_me=%s",
+            chat_id,
+            message_ids,
+            for_me,
+        )
+        frame = DeleteCommentPayload(
+            chat_id=chat_id,
+            post_id=post_id,
+            message_ids=message_ids,
+            for_me=for_me,
+        )
+
+        await self.app.invoke(Opcode.MSG_DELETE, frame.to_payload())
+        logger.info("messages deleted chat_id=%s count=%s", chat_id, len(message_ids))
+        return True
+
+    async def add_comment_reaction(
+        self,
+        chat_id: int,
+        post_id: int,
+        message_id: int,
+        reaction: str,
+    ) -> ReactionInfo | None:
+        logger.info(
+            "adding reaction chat_id=%s message_id=%s reaction=%s",
+            chat_id,
+            message_id,
+            reaction,
+        )
+        frame = AddCommentReactionPayload(
+            chat_id=chat_id,
+            post_id=post_id,
+            message_id=message_id,
+            reaction=ReactionInfoPayload(id=reaction),
+        )
+
+        response = await self.app.invoke(Opcode.MSG_REACTION, frame.to_payload())
+        reaction_info = payload_item(response, MessagePayloadKey.REACTION_INFO)
+        if reaction_info:
+            return ReactionInfo.model_validate(reaction_info)
+
+        return None
+
+    async def remove_comment_reaction(
+        self,
+        chat_id: int,
+        post_id: int,
+        message_id: int,
+    ) -> ReactionInfo | None:
+        logger.info(
+            "removing reaction chat_id=%s message_id=%s",
+            chat_id,
+            message_id,
+        )
+        frame = RemoveCommentReactionPayload(
+            chat_id=chat_id, post_id=post_id, message_id=message_id
+        )
+
+        response = await self.app.invoke(
+            Opcode.MSG_CANCEL_REACTION,
+            frame.to_payload(),
+        )
+        reaction_info = payload_item(response, MessagePayloadKey.REACTION_INFO)
+        if reaction_info:
+            return ReactionInfo.model_validate(reaction_info)
+
+        return None
+
+    async def subscribe_comments(
+        self,
+        chat_id: int,
+        post_id: int,
+        subscribe: bool = True,
+    ) -> None:
+        frame = SubscribeCommentsPayload(chat_id=chat_id, post_id=post_id, subscribe=subscribe)
+        await self.app.invoke(Opcode.CHAT_SUBSCRIBE, frame.to_payload())
+
+    async def get_comments_info(
+        self,
+        chat_id: int,
+        post_ids: list[int],
+    ) -> list[CommentsInfoUpdate]:
+        frame = GetCommentsInfoPayload(chat_id=chat_id, post_ids=post_ids)
+        response = await self.app.invoke(Opcode.MSG_GET_COMMENTS_INFO, frame.to_payload())
+        return parse_payload_list(
+            response,
+            MessagePayloadKey.COMMENTS_INFO_UPDATES,
+            CommentsInfoUpdate,
+        )
+
+    async def delete_user_comments(
+        self,
+        chat_id: int,
+        post_id: int,
+        user_id: int,
+        message_id: int,
+    ) -> bool:
+        frame = DeleteUserCommentsPayload(
+            chat_id=chat_id,
+            post_id=post_id,
+            user_id=user_id,
+            message_id=message_id,
+        )
+        await self.app.invoke(Opcode.MSG_DELETE_USER_COMMENTS, frame.to_payload())
+        return True

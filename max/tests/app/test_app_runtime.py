@@ -1,0 +1,773 @@
+from __future__ import annotations
+
+import asyncio
+from collections import deque
+from types import SimpleNamespace
+
+import pytest
+
+from pymax.app import App
+from pymax.auth.models import AuthResult
+from pymax.base import BaseClient
+from pymax.dispatch import Dispatcher, EventType, Router
+from pymax.exceptions import ApiError
+from pymax.protocol import Command, InboundFrame, Opcode
+from pymax.session.models import SessionInfo
+from tests.conftest import frame, make_config, mobile_user_agent, profile_payload, user_payload
+
+
+class RuntimeStore:
+    def __init__(self, loaded: SessionInfo | None = None) -> None:
+        self.loaded = loaded
+        self.saved: list[SessionInfo] = []
+        self.deleted: list[str] = []
+        self.deleted_all = False
+        self.closed = False
+
+    async def load_session(self) -> SessionInfo | None:
+        return self.loaded
+
+    async def save_session(self, session: SessionInfo) -> None:
+        self.saved.append(session)
+        self.loaded = session
+
+    async def update_token(self, old_token: str, new_token: str) -> None:
+        if self.loaded and self.loaded.token == old_token:
+            self.loaded = self.loaded.model_copy(update={"token": new_token})
+
+    async def delete_session(self, token: str) -> None:
+        self.deleted.append(token)
+        if self.loaded and self.loaded.token == token:
+            self.loaded = None
+
+    async def delete_all_sessions(self) -> None:
+        self.deleted_all = True
+        self.loaded = None
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class RuntimeConnection:
+    def __init__(self, responses: list[InboundFrame]) -> None:
+        self.responses = deque(responses)
+        self.protocol = SimpleNamespace(version=10)
+        self.sent = []
+        self.opened = False
+        self.closed = False
+        self.failed = None
+        self.on_event = None
+        self.on_close = None
+        self._seq = -1
+
+    async def open(self) -> None:
+        self.opened = True
+
+    async def close(self) -> None:
+        self.closed = True
+        self.opened = False
+
+    async def fail(self, exc: Exception | None = None) -> None:
+        self.failed = exc
+        self.opened = False
+        if self.on_close:
+            self.on_close(exc)
+
+    async def request(self, outbound, timeout=None):
+        self.sent.append((outbound, timeout))
+        return self.responses.popleft()
+
+    async def wait_closed(self) -> None:
+        return None
+
+    def next_seq(self) -> int:
+        self._seq += 1
+        return self._seq
+
+    @property
+    def is_open(self) -> bool:
+        return self.opened
+
+
+class StaticAuthFlow:
+    async def authenticate(self, app: App) -> AuthResult:
+        return AuthResult(token="auth-token")
+
+
+class RuntimeClient(BaseClient["RuntimeClient"]):
+    def __init__(self, app: App["RuntimeClient"], router: Router["RuntimeClient"]) -> None:
+        self._app = app
+        self._connection = app.connection
+        self._router = router
+        self._config = app.config
+        self._auth_flow = app.auth_flow
+        self.extra_config = SimpleNamespace(
+            reconnect=False,
+            reconnect_delay=0,
+            relogin=True,
+            token=app.config.token,
+        )
+
+    def _build_connection(self) -> RuntimeConnection:
+        return self._connection
+
+    async def _prepare_config(self):
+        return self._config
+
+    async def _ensure_runtime(self) -> None:
+        """Keep the explicitly assembled runtime used by these lifecycle tests."""
+        return None
+
+
+@pytest.mark.asyncio
+async def test_app_start_with_config_token_handshakes_logs_in_and_saves_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def idle_ping_loop(self):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(App, "_ping_loop", idle_ping_loop)
+    store = RuntimeStore()
+    config = make_config().model_copy(update={"token": "config-token", "store": store})
+    connection = RuntimeConnection(
+        [
+            frame({"callsSeed": 123}),
+            frame(
+                {
+                    "profile": profile_payload(77),
+                    "token": "login-token",
+                    "contacts": [profile_payload(77)["contact"]],
+                    "chats": [],
+                    "messages": {},
+                }
+            ),
+        ]
+    )
+    app: App[object] = App(connection, config, StaticAuthFlow())
+
+    await app.start()
+
+    assert app.started is True
+    assert app.me is not None
+    assert app.me.contact.id == 77
+    assert store.saved[0].token == "config-token"
+    assert store.saved[0].user_agent == config.device.user_agent
+    assert [sent[0].opcode for sent in connection.sent] == [
+        Opcode.SESSION_INIT,
+        Opcode.LOGIN,
+    ]
+
+    await app.close()
+    assert connection.closed is True
+    assert store.closed is True
+
+
+@pytest.mark.asyncio
+async def test_app_start_restores_session_user_agent_before_handshake(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def idle_ping_loop(self):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(App, "_ping_loop", idle_ping_loop)
+    stored_user_agent = mobile_user_agent().model_copy(
+        update={
+            "app_version": "26.13.0",
+            "build_number": 6683,
+            "device_name": "Stored Pixel",
+            "os_version": "Android 13",
+            "screen": "1440x3120",
+            "timezone": "Asia/Yekaterinburg",
+        }
+    )
+    store = RuntimeStore(
+        SessionInfo(
+            token="stored-token",
+            device_id="stored-device",
+            phone="+79990000000",
+            mt_instance_id="stored-mt",
+            user_agent=stored_user_agent,
+        )
+    )
+    config = make_config().model_copy(update={"store": store})
+    connection = RuntimeConnection(
+        [
+            frame({"callsSeed": 123}),
+            frame(
+                {
+                    "profile": profile_payload(77),
+                    "contacts": [],
+                    "chats": [],
+                    "messages": {},
+                }
+            ),
+        ]
+    )
+    app: App[object] = App(connection, config, StaticAuthFlow())
+
+    await app.start()
+
+    restored = app.config.device.user_agent
+    assert restored.device_name == "Stored Pixel"
+    assert restored.os_version == "Android 13"
+    assert restored.screen == "1440x3120"
+    assert restored.timezone == "Asia/Yekaterinburg"
+    assert restored.arch == "arm64-v8a"
+    assert restored.app_version == "26.14.1"
+    assert restored.build_number == 6686
+    assert connection.sent[0][0].payload["userAgent"] == restored.to_payload()
+    assert app.session is not None
+    assert app.session.user_agent == restored
+    assert store.saved[-1].user_agent == restored
+
+    await app.close()
+
+
+@pytest.mark.asyncio
+async def test_app_start_keeps_explicit_user_agent_over_session_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def idle_ping_loop(self):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(App, "_ping_loop", idle_ping_loop)
+    stored_user_agent = mobile_user_agent().model_copy(update={"device_name": "Stored Pixel"})
+    explicit_user_agent = mobile_user_agent().model_copy(update={"device_name": "Explicit Pixel"})
+    store = RuntimeStore(
+        SessionInfo(
+            token="stored-token",
+            device_id="stored-device",
+            phone="+79990000000",
+            user_agent=stored_user_agent,
+        )
+    )
+    config = make_config().model_copy(
+        update={
+            "store": store,
+            "restore_user_agent_from_session": False,
+        }
+    )
+    config.device.user_agent = explicit_user_agent
+    connection = RuntimeConnection(
+        [
+            frame({"callsSeed": 123}),
+            frame(
+                {
+                    "profile": profile_payload(77),
+                    "contacts": [],
+                    "chats": [],
+                    "messages": {},
+                }
+            ),
+        ]
+    )
+    app: App[object] = App(connection, config, StaticAuthFlow())
+
+    await app.start()
+
+    assert app.config.device.user_agent == explicit_user_agent
+    assert connection.sent[0][0].payload["userAgent"] == explicit_user_agent.to_payload()
+    assert app.session is not None
+    assert app.session.user_agent == explicit_user_agent
+    assert store.saved[-1].user_agent == explicit_user_agent
+
+    await app.close()
+
+
+@pytest.mark.asyncio
+async def test_app_start_completes_login2_and_uses_deferred_profile_and_contacts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def idle_ping_loop(self):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(App, "_ping_loop", idle_ping_loop)
+    store = RuntimeStore()
+    config = make_config().model_copy(update={"token": "config-token", "store": store})
+    connection = RuntimeConnection(
+        [
+            frame({"callsSeed": 123}),
+            frame(
+                {
+                    "token": "login-token",
+                    "chats": [],
+                    "messages": {},
+                    "time": 777,
+                    "config": {"hash": "login-hash"},
+                    "login2Flags": {
+                        "contactEnabled": True,
+                        "configEnabled": True,
+                        "profileEnabled": True,
+                    },
+                }
+            ),
+            frame(
+                {
+                    "profile": profile_payload(77),
+                    "contactInfos": [user_payload(88)],
+                    "config": {"hash": "login2-hash"},
+                }
+            ),
+        ]
+    )
+    app: App[object] = App(connection, config, StaticAuthFlow())
+
+    await app.start()
+
+    assert app.started is True
+    assert app.me is not None
+    assert app.me.contact.id == 77
+    assert app.me.contact._actions is app.api.users
+    assert app.contacts[0] is not None
+    assert app.contacts[0].id == 88
+    assert app.contacts[0]._actions is app.api.users
+    assert app.session is not None
+    assert app.session.token == "login-token"
+    assert app.session.sync.config_hash == "login2-hash"
+    assert [sent[0].opcode for sent in connection.sent] == [
+        Opcode.SESSION_INIT,
+        Opcode.LOGIN,
+        Opcode.LOGIN2,
+    ]
+    assert connection.sent[2][0].payload == {
+        "needProfile": True,
+        "contactsSync": 777,
+        "configHash": "login-hash",
+    }
+
+    await app.close()
+
+
+@pytest.mark.asyncio
+async def test_app_start_keeps_login_contacts_when_login2_contacts_are_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def idle_ping_loop(self):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(App, "_ping_loop", idle_ping_loop)
+    store = RuntimeStore()
+    config = make_config().model_copy(update={"token": "config-token", "store": store})
+    connection = RuntimeConnection(
+        [
+            frame({"callsSeed": 123}),
+            frame(
+                {
+                    "profile": profile_payload(77),
+                    "contacts": [user_payload(88)],
+                    "login2Flags": {"configEnabled": True},
+                }
+            ),
+            frame({"config": {"hash": "login2-hash"}}),
+        ]
+    )
+    app: App[object] = App(connection, config, StaticAuthFlow())
+
+    await app.start()
+
+    assert app.contacts[0] is not None
+    assert app.contacts[0].id == 88
+    assert connection.sent[2][0].payload["contactsSync"] == -1
+
+    await app.close()
+
+
+@pytest.mark.asyncio
+async def test_app_start_emits_missing_profile_error_to_root_router(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def idle_ping_loop(self):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(App, "_ping_loop", idle_ping_loop)
+    store = RuntimeStore()
+    config = make_config().model_copy(update={"token": "config-token", "store": store})
+    connection = RuntimeConnection(
+        [
+            frame({"callsSeed": 123}),
+            frame({"chats": [], "messages": {}}),
+        ]
+    )
+    root_router: Router[object] = Router()
+    app: App[object] = App(connection, config, StaticAuthFlow(), root_router)
+    app.dispatcher.bind_client(object())
+    seen: list[Exception] = []
+
+    @root_router.on_error()
+    async def on_error(exc, ctx):
+        seen.append(exc)
+
+    await app.start()
+
+    assert len(seen) == 1
+    assert isinstance(seen[0], RuntimeError)
+    assert str(seen[0]) == "Login response does not contain profile"
+    assert app.started is False
+    assert connection.closed is True
+    assert store.closed is False
+
+    await app.close()
+
+    assert store.closed is True
+
+
+@pytest.mark.asyncio
+async def test_app_start_emits_login_errors_to_root_router(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def idle_ping_loop(self):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(App, "_ping_loop", idle_ping_loop)
+    store = RuntimeStore()
+    config = make_config().model_copy(update={"token": "config-token", "store": store})
+    connection = RuntimeConnection(
+        [
+            frame({"callsSeed": 123}),
+            InboundFrame(
+                opcode=Opcode.LOGIN,
+                cmd=Command.ERROR,
+                seq=1,
+                payload={
+                    "error": "login_failed",
+                    "title": "Login failed",
+                    "message": "Login failed",
+                    "localizedMessage": "Login failed",
+                },
+            ),
+        ]
+    )
+    root_router: Router[object] = Router()
+    app: App[object] = App(connection, config, StaticAuthFlow(), root_router)
+    client = object()
+    app.dispatcher.bind_client(client)
+    seen = []
+
+    @root_router.on_error()
+    async def on_error(exc, ctx):
+        seen.append((exc, ctx))
+
+    await app.start()
+
+    assert len(seen) == 1
+    exc, ctx = seen[0]
+    assert isinstance(exc, ApiError)
+    assert ctx.client is client
+    assert ctx.event_type is EventType.ON_START
+    assert ctx.event is None
+    assert ctx.router is root_router
+    assert ctx.handler is None
+    assert app.started is False
+    assert connection.closed is True
+    assert store.closed is False
+
+    await app.close()
+
+    assert store.closed is True
+
+
+@pytest.mark.asyncio
+async def test_client_start_does_not_emit_on_start_after_handled_login_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def idle_ping_loop(self):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(App, "_ping_loop", idle_ping_loop)
+    store = RuntimeStore()
+    config = make_config().model_copy(update={"token": "config-token", "store": store})
+    connection = RuntimeConnection(
+        [
+            frame({"callsSeed": 123}),
+            InboundFrame(
+                opcode=Opcode.LOGIN,
+                cmd=Command.ERROR,
+                seq=1,
+                payload={
+                    "error": "login_failed",
+                    "title": "Login failed",
+                    "message": "Login failed",
+                    "localizedMessage": "Login failed",
+                },
+            ),
+        ]
+    )
+    root_router: Router[RuntimeClient] = Router()
+    app: App[RuntimeClient] = App(connection, config, StaticAuthFlow(), root_router)
+    client = RuntimeClient(app, root_router)
+    app.dispatcher.bind_client(client)
+    errors: list[Exception] = []
+    started = False
+
+    @root_router.on_error()
+    async def on_error(exc, ctx):
+        errors.append(exc)
+
+    @root_router.on_start()
+    async def on_start(_client):
+        nonlocal started
+        started = True
+
+    await client.start()
+
+    assert len(errors) == 1
+    assert isinstance(errors[0], ApiError)
+    assert started is False
+    assert app.started is False
+    assert connection.closed is True
+    assert store.closed is True
+
+
+@pytest.mark.parametrize(
+    ("error", "message"),
+    [
+        ("FAIL_LOGIN_TOKEN", "Token expired"),
+        ("login_failed", "FAIL_LOGIN_TOKEN"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_client_start_reauthenticates_after_login_token_revocation(
+    monkeypatch: pytest.MonkeyPatch,
+    error: str,
+    message: str,
+) -> None:
+    async def idle_ping_loop(self):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(App, "_ping_loop", idle_ping_loop)
+    old_session = SessionInfo(token="revoked-token", device_id="dev", phone="+7")
+    store = RuntimeStore(old_session)
+    config = make_config().model_copy(update={"token": "revoked-token", "store": store})
+    connection = RuntimeConnection(
+        [
+            frame({"callsSeed": 123}),
+            InboundFrame(
+                opcode=Opcode.LOGIN,
+                cmd=Command.ERROR,
+                seq=1,
+                payload={
+                    "error": error,
+                    "title": "Login failed",
+                    "message": message,
+                    "localizedMessage": "Session expired",
+                },
+            ),
+            frame({"callsSeed": 456}),
+            frame(
+                {
+                    "profile": profile_payload(77),
+                    "token": "new-login-token",
+                    "contacts": [profile_payload(77)["contact"]],
+                    "chats": [],
+                    "messages": {},
+                }
+            ),
+        ]
+    )
+    root_router: Router[RuntimeClient] = Router()
+    app: App[RuntimeClient] = App(connection, config, StaticAuthFlow(), root_router)
+    client = RuntimeClient(app, root_router)
+    app.dispatcher.bind_client(client)
+    errors: list[Exception] = []
+
+    @root_router.on_error()
+    async def on_error(exc, ctx):
+        errors.append(exc)
+
+    await client.start()
+
+    assert errors == []
+    assert store.deleted == ["revoked-token"]
+    assert store.saved[0].token == "auth-token"
+    assert store.loaded is not None
+    assert store.loaded.token == "new-login-token"
+    assert client.extra_config.token is None
+    assert client._config.token is None
+    assert client.me is not None
+
+
+@pytest.mark.asyncio
+async def test_client_start_emits_disconnect_before_reraising_without_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def idle_ping_loop(self):
+        await asyncio.Event().wait()
+
+    async def fail_wait_closed() -> None:
+        raise ConnectionError("Connection lost")
+
+    monkeypatch.setattr(App, "_ping_loop", idle_ping_loop)
+    store = RuntimeStore()
+    config = make_config().model_copy(update={"token": "config-token", "store": store})
+    connection = RuntimeConnection(
+        [
+            frame({"callsSeed": 123}),
+            frame(
+                {
+                    "profile": profile_payload(77),
+                    "token": "login-token",
+                    "contacts": [profile_payload(77)["contact"]],
+                    "chats": [],
+                    "messages": {},
+                }
+            ),
+        ]
+    )
+    connection.wait_closed = fail_wait_closed
+    root_router: Router[RuntimeClient] = Router()
+    app: App[RuntimeClient] = App(connection, config, StaticAuthFlow(), root_router)
+    client = RuntimeClient(app, root_router)
+    app.dispatcher.bind_client(client)
+    seen: list[tuple[str, bool, float]] = []
+
+    @root_router.on_disconnect()
+    async def on_disconnect(exc, reconnect, delay):
+        seen.append((str(exc), reconnect, delay))
+
+    with pytest.raises(ConnectionError, match="Connection lost"):
+        await client.start()
+
+    assert seen == [("Connection lost", False, 0)]
+    assert connection.closed is True
+    assert store.closed is True
+
+
+@pytest.mark.asyncio
+async def test_emit_disconnect_logs_handler_errors_without_raising() -> None:
+    app = SimpleNamespace()
+    router: Router[object] = Router()
+    dispatcher: Dispatcher[object] = Dispatcher(app, router)
+    dispatcher.bind_client(object())
+    seen: list[str] = []
+
+    @router.on_disconnect()
+    async def broken(_exc, _reconnect, _delay):
+        raise RuntimeError("handler failed")
+
+    @router.on_disconnect()
+    async def next_handler(exc, reconnect, delay):
+        seen.append(f"{exc}:{reconnect}:{delay}")
+
+    await dispatcher.emit_disconnect(ConnectionError("lost"), True, 1.5)
+
+    assert seen == ["lost:True:1.5"]
+
+
+@pytest.mark.asyncio
+async def test_client_relogin_deletes_loaded_session_only() -> None:
+    session = SessionInfo(token="token", device_id="dev", phone="")
+    store = RuntimeStore(session)
+    config = make_config().model_copy(update={"store": store, "token": "config-token"})
+    connection = RuntimeConnection([])
+    root_router: Router[RuntimeClient] = Router()
+    app: App[RuntimeClient] = App(connection, config, StaticAuthFlow(), root_router)
+    app.session = session
+    client = RuntimeClient(app, root_router)
+    app.dispatcher.bind_client(client)
+
+    await client.relogin(start=False)
+
+    assert store.deleted == ["token"]
+    assert store.deleted_all is False
+    assert store.loaded is None
+    assert client.extra_config.token is None
+    assert client._config.token is None
+
+
+@pytest.mark.asyncio
+async def test_client_relogin_requires_loaded_session() -> None:
+    store = RuntimeStore()
+    config = make_config().model_copy(update={"store": store})
+    connection = RuntimeConnection([])
+    root_router: Router[RuntimeClient] = Router()
+    app: App[RuntimeClient] = App(connection, config, StaticAuthFlow(), root_router)
+    client = RuntimeClient(app, root_router)
+    app.dispatcher.bind_client(client)
+
+    with pytest.raises(RuntimeError, match="Cannot relogin before session is loaded"):
+        await client.relogin(start=False)
+
+    assert store.deleted == []
+    assert store.deleted_all is False
+
+
+@pytest.mark.asyncio
+async def test_app_invoke_turns_error_frames_into_api_error() -> None:
+    store = RuntimeStore(SessionInfo(token="token", device_id="dev", phone="+7"))
+    config = make_config().model_copy(update={"store": store})
+    connection = RuntimeConnection(
+        [
+            InboundFrame(
+                opcode=Opcode.PING,
+                cmd=Command.ERROR,
+                seq=1,
+                payload={
+                    "error": "rate_limited",
+                    "title": "Slow down",
+                    "message": "Too many requests",
+                    "localizedMessage": "Too many requests",
+                },
+            )
+        ]
+    )
+    app: App[object] = App(connection, config, StaticAuthFlow())
+
+    with pytest.raises(ApiError) as exc_info:
+        await app.invoke(Opcode.PING, {"interactive": True})
+
+    assert exc_info.value.error == "rate_limited"
+    assert exc_info.value.opcode == Opcode.PING
+    assert connection.sent[0][0].seq == 0
+
+
+@pytest.mark.asyncio
+async def test_app_invoke_uses_config_timeout_and_allows_override() -> None:
+    store = RuntimeStore(SessionInfo(token="token", device_id="dev", phone="+7"))
+    config = make_config().model_copy(update={"request_timeout": 12.5, "store": store})
+    connection = RuntimeConnection([frame({}), frame({})])
+    app: App[object] = App(connection, config, StaticAuthFlow())
+
+    await app.invoke(Opcode.PING, {"interactive": True})
+    await app.invoke(Opcode.PING, {"interactive": True}, timeout=3.0)
+
+    assert connection.sent[0][1] == 12.5
+    assert connection.sent[1][1] == 3.0
+
+
+@pytest.mark.asyncio
+async def test_app_marks_stopped_and_cancels_ping_on_connection_loss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def idle_ping_loop(self):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(App, "_ping_loop", idle_ping_loop)
+    store = RuntimeStore()
+    config = make_config().model_copy(update={"token": "config-token", "store": store})
+    connection = RuntimeConnection(
+        [
+            frame({"callsSeed": 123}),
+            frame(
+                {
+                    "profile": profile_payload(77),
+                    "contacts": [profile_payload(77)["contact"]],
+                    "chats": [],
+                    "messages": {},
+                }
+            ),
+        ]
+    )
+    app: App[object] = App(connection, config, StaticAuthFlow())
+
+    await app.start()
+    assert app.started is True
+    ping_task = app._ping_task
+    assert ping_task is not None
+
+    await connection.fail(ConnectionError("lost"))
+    await asyncio.sleep(0)
+
+    assert app.started is False
+    assert ping_task.cancelled()
+
+    await app.close()

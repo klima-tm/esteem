@@ -1,0 +1,11 @@
+{
+  "platform": "telegram",
+  "user_id": "REPLACE_WITH_VERIFIED_TELEGRAM_ID",
+  "username": "owner_username",
+  "name": "Owner",
+  "role": "owner",
+  "permissions": [
+    "start_conversation"
+  ],
+  "context": "Owner-maintained identity context. Never update automatically."
+}
