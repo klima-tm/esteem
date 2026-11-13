@@ -723,6 +723,30 @@ install_funnel(app, telegram)
 
 # ==================== Main ====================
 
+_handoff_group_entity = None
+
+@app.get("/handoff/group-events", response_model=ApiResponse)
+async def handoff_group_events(after: int = Query(0, ge=0)):
+    from pathlib import Path
+    cfg=json.loads(Path('/root/projects/esteem/control/state/handoff-config.json').read_text())
+    group=cfg['group_id']
+    global _handoff_group_entity
+    if _handoff_group_entity is None:
+        async for dialog in telegram.client.iter_dialogs():
+            if dialog.is_group and dialog.entity.id==group:
+                _handoff_group_entity=dialog.entity
+                break
+    entity=_handoff_group_entity
+    if entity is None:raise HTTPException(404,'Configured handoff group unavailable')
+    if not after:
+        recent=await telegram.client.get_messages(entity,limit=1)
+        return ApiResponse(success=True,data=json.dumps({'events':[],'latest':recent[0].id if recent else 0}))
+    messages=await telegram.client.get_messages(entity,min_id=after,limit=100,reverse=True)
+    events=[{'id':m.id,'group':group,'sender':m.sender_id,'out':m.out,'text':m.message or '',
+             'reply_to':m.reply_to.reply_to_msg_id if m.reply_to else None} for m in messages]
+    return ApiResponse(success=True,data=json.dumps({'events':events,'latest':events[-1]['id'] if events else after}))
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=8080)

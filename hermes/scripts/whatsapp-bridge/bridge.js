@@ -21,6 +21,8 @@
 
 import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage, getAggregateVotesInPollMessage, decryptPollVote, getKeyAuthor, jidNormalizedUser } from '@whiskeysockets/baileys';
 import express from 'express';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { appendFileSync } from 'node:fs';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import path from 'path';
@@ -142,18 +144,45 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+const esteemSendContext = new AsyncLocalStorage();
+const esteemDispatched = new Map();
+const esteemHandoffEnabled = process.env.ESTEEM_HANDOFF_ENABLED === 'true';
+async function esteemHandoff(route, data) {
+  const token=readFileSync('/root/projects/esteem/control/token','utf8').trim();
+  const response=await fetch('http://127.0.0.1:3014'+route,{
+    method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},
+    body:JSON.stringify({channel:'whatsapp',...data}),signal:AbortSignal.timeout(90000)});
+  if (!response.ok) throw new Error('Esteem handoff service unavailable');
+  return response.json();
+}
+async function esteemSendAllowed(chatId) {
+  if (!esteemHandoffEnabled || esteemSendContext.getStore()===true) return;
+  const origin=esteemDispatched.get(chatId);
+  const state=await esteemHandoff('/state',{chat:chatId,stamp:origin?.stamp});
+  if (!state.allowed && !(state.mode==='waiting_human' && state.ack_source===origin?.mid))
+    throw new Error('Esteem: AI delivery paused for human handoff');
+}
+
 function sendWithTimeout(chatId, payload, options = {}, timeoutMs = SEND_TIMEOUT_MS) {
-  let timer;
-  const timeoutPromise = new Promise((_, reject) => {
-    timer = setTimeout(
-      () => reject(new Error(`sendMessage timed out after ${timeoutMs / 1000}s`)),
-      timeoutMs,
-    );
+  return enqueueSend(async () => {
+    await esteemSendAllowed(chatId);
+    let lease=null;
+    if (esteemHandoffEnabled && esteemSendContext.getStore()!==true) {
+      const origin=esteemDispatched.get(chatId);
+      lease=await esteemHandoff('/begin-send',{chat:chatId,stamp:origin?.stamp,source:origin?.mid});
+      if (!lease.allowed) throw new Error('Esteem: AI delivery paused for human handoff');
+    }
+    let timer;
+    try {
+      return await Promise.race([
+        sock.sendMessage(chatId, payload, options),
+        new Promise((_,reject) => { timer=setTimeout(() => reject(new Error('WhatsApp send timed out')),timeoutMs); })
+      ]);
+    } finally {
+      clearTimeout(timer);
+      if (lease?.token) { try { await esteemHandoff('/end-send',{token:lease.token}); } catch {} }
+    }
   });
-  return enqueueSend(() =>
-    Promise.race([sock.sendMessage(chatId, payload, options), timeoutPromise])
-      .finally(() => clearTimeout(timer))
-  );
 }
 
 function formatOutgoingMessage(message) {
@@ -555,6 +584,23 @@ async function startSocket() {
         messageKeys: Object.keys(msg.message || {}),
       });
 
+      if (esteemHandoffEnabled && !isGroup && matchesAllowedUser(chatId, ALLOWED_USERS, SESSION_DIR)) {
+        const raw=msg.message || {};
+        const body=raw.conversation || raw.extendedTextMessage?.text || raw.imageMessage?.caption || raw.videoMessage?.caption || '[Media]';
+        const stamp=Number(msg.messageTimestamp) || Math.floor(Date.now()/1000);
+        const entry={chat:chatId,mid:msg.key.id,text:body,outgoing:!!msg.key.fromMe,stamp};
+        const folder='/root/projects/esteem/hermes/state';
+        mkdirSync(folder,{recursive:true,mode:0o700});
+        appendFileSync(folder+'/handoff-events.jsonl',JSON.stringify(entry)+'\n',{mode:0o600});
+        try {
+          const state=await esteemHandoff('/event',entry);
+          if (!msg.key.fromMe && !state.allowed) continue;
+        } catch(err) {
+          console.error('Esteem handoff unavailable; automatic response held');
+          continue;
+        }
+      }
+
       // Handle fromMe messages based on mode
       let fromOwner = false;
       if (msg.key.fromMe) {
@@ -759,6 +805,7 @@ async function startSocket() {
         continue;
       }
 
+      if (esteemHandoffEnabled) esteemDispatched.set(chatId,{mid:msg.key.id,stamp:Number(msg.messageTimestamp)});
       messageStore.remember(msg);
       messageQueue.push(event);
       emitDebugEvent({
@@ -781,6 +828,15 @@ async function startSocket() {
 // HTTP server
 const app = express();
 app.use(express.json());
+app.use((req,res,next) => {
+  let manager=false;
+  if (esteemHandoffEnabled && req.path==='/send' && req.body?.esteemManagerToken) {
+    manager=req.body.esteemManagerToken===readFileSync('/root/projects/esteem/control/token','utf8').trim();
+    if (!manager) return res.status(403).json({error:'Invalid manager authorization'});
+  }
+  esteemSendContext.run(manager,next);
+});
+
 
 // Host-header validation — defends against DNS rebinding.
 // The bridge binds loopback-only (127.0.0.1) but a victim browser on

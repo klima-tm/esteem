@@ -40,9 +40,11 @@ class ContinuationTests(unittest.TestCase):
         tags=['mats','mercedes','gclass','black']
         photos=[{'id':'id:new','path':'/cached.jpg','tags':tags+['2d']}]
         context={'exclude_ids':['id:old'],'last_search_tags':tags}
-        with patch.object(model,'reply',return_value={'reply':'More examples','photo_tags':tags}) as reply,patch.object(lib.DropboxPhotos,'prepare',return_value=photos) as prepare:
+        with patch.object(model,'reply',return_value={'reply':'More examples','photo_tags':tags}) as reply,patch.object(model,'inspect_outgoing',return_value={'reply':'Examples','image_description':'Photo 1: black mat with raised sides.'}) as inspect,patch.object(lib.DropboxPhotos,'prepare',return_value=photos) as prepare:
             result=model.reply_for_contact([],'More please','telegram',0,photo_context=context)
         prepare.assert_called_once_with(tags,5,exclude_ids=['id:old'])
+        inspect.assert_called_once()
+        self.assertIn('Photo 1: black mat',lib.history_text(result))
         self.assertIn(json.dumps(tags),reply.call_args.kwargs['tool_result'])
         self.assertEqual(json.loads(result[len(lib.PREFIX):])['search_tags'],tags)
     def test_exhausted_search_uses_truthful_fallback(self):

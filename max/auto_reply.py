@@ -43,7 +43,22 @@ class Replies:
         self.db.commit()
         self.queue = asyncio.Queue()
 
+    def handoff(self):
+        import sys
+        path=str(ROOT.parent/'control')
+        if path not in sys.path:sys.path.insert(0,path)
+        import handoff_client
+        return handoff_client
+
     async def capture(self, message, client):
+        if self.config.get('handoff_enabled') and message.chat_id in self.allowed.values() and message.type=='USER':
+            outgoing=message.sender==self.config['expected_sender_id']
+            stamp=message.time/1000 if message.time>10**11 else message.time
+            with self.db:
+                self.db.execute('INSERT OR IGNORE INTO history(chat_id,message_id,role,text) VALUES(?,?,?,?)',
+                                (message.chat_id,message.id,'assistant' if outgoing else 'user',message.text or '[Media]'))
+            try:await asyncio.to_thread(self.handoff().event,'max',message.chat_id,message.id,message.text or '[Media]',outgoing,stamp)
+            except Exception:LOG.warning('Handoff history sync deferred; native history retained')
         expected = self.allowed.get(message.sender)
         stamp = message.time / 1000 if message.time > 10**11 else message.time
         if (message.sender == self.config['expected_sender_id'] or expected is None
@@ -61,6 +76,11 @@ class Replies:
         row = self.db.execute('SELECT * FROM jobs WHERE chat_id=? AND message_id=?',key).fetchone()
         if not row or row['status'] not in ('received','generated'):
             return
+        if self.config.get('handoff_enabled'):
+            state=await asyncio.to_thread(self.handoff().state,'max',key[0],row['stamp'])
+            if not state['allowed'] and state.get('ack_source')!=str(key[1]):
+                with self.db:self.db.execute("UPDATE jobs SET status='cancelled' WHERE chat_id=? AND message_id=?",key)
+                return
         if row['status'] == 'received':
             history = list(self.db.execute('SELECT role,text FROM history WHERE chat_id=? ORDER BY seq DESC LIMIT 16',(key[0],)))
             history = [{'role':r['role'],'text':r['text']} for r in reversed(history)]
@@ -77,10 +97,10 @@ class Replies:
                         updated=await asyncio.to_thread(self.model.summarize,summary,[{'role':r['role'],'text':r['text']} for r in batch])
                         memory.save(key[0],updated,batch[-1]['cursor'],through,[r['cursor'] for r in batch])
                     uid=next(uid for uid,cid in self.allowed.items() if cid==key[0])
-                    reply=await asyncio.to_thread(self.model.reply_for_contact,history,row['text'],"max",uid,summary=summary)
+                    reply=await asyncio.to_thread(self.model.reply_for_contact,history,row['text'],"max",uid,summary=summary,photo_context={"handoff_chat":str(key[0]),"handoff_source":str(key[1])})
                 elif hasattr(self.model,"reply_for_contact"):
                     uid = next(uid for uid,cid in self.allowed.items() if cid==key[0])
-                    reply = await asyncio.to_thread(self.model.reply_for_contact,history,row['text'],"max",uid)
+                    reply = await asyncio.to_thread(self.model.reply_for_contact,history,row['text'],"max",uid,photo_context={"handoff_chat":str(key[0]),"handoff_source":str(key[1])})
                 else:
                     reply = await asyncio.to_thread(self.model.reply,history,row['text'])
             except Exception as exc:
@@ -97,6 +117,19 @@ class Replies:
                 self.db.execute("UPDATE jobs SET status='generated',reply=? WHERE chat_id=? AND message_id=?",(reply,*key))
         else:
             reply = row['reply']
+        if self.config.get('handoff_enabled'):
+            state=await asyncio.to_thread(self.handoff().state,'max',key[0],row['stamp'])
+            if not state['allowed'] and state.get('ack_source')!=str(key[1]):
+                with self.db:self.db.execute("UPDATE jobs SET status='cancelled' WHERE chat_id=? AND message_id=?",key)
+                return
+        send_token=None
+        if self.config.get('handoff_enabled'):
+            permit=await asyncio.to_thread(self.handoff().call,'/begin-send',{'channel':'max','chat':str(key[0]),
+                           'stamp':row['stamp'],'source':str(key[1])})
+            if not permit['allowed']:
+                with self.db:self.db.execute("UPDATE jobs SET status='cancelled' WHERE chat_id=? AND message_id=?",key)
+                return
+            send_token=permit['token']
         # Persist before send: an ambiguous failure or crash is never auto-retried.
         with self.db:
             self.db.execute("UPDATE jobs SET status='sending' WHERE chat_id=? AND message_id=?",key)
@@ -113,6 +146,10 @@ class Replies:
                 self.db.execute("UPDATE jobs SET status='uncertain' WHERE chat_id=? AND message_id=?",key)
             LOG.error('Send outcome uncertain (%s); manual review required',type(exc).__name__)
             return
+        finally:
+            if send_token:
+                try:await asyncio.to_thread(self.handoff().call,'/end-send',{'token':send_token})
+                except Exception:LOG.warning('Send lease release deferred')
         with self.db:
             self.db.execute("UPDATE jobs SET status='sent',reply_id=? WHERE chat_id=? AND message_id=?",(sent.id,*key))
             self.db.execute('INSERT OR IGNORE INTO history(chat_id,message_id,role,text) VALUES(?,?,?,?)',(*key,'user',row['text']))

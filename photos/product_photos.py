@@ -204,10 +204,11 @@ class DropboxPhotos:
         return ready
 
 
-def pack_reply(text, photos, search_tags=None):
+def pack_reply(text, photos, search_tags=None, visual_notes=None):
     if not photos: return text
     if len(text)>1000: text=text[:997]+'…'
     data={'text':text,'photos':photos}
+    if visual_notes is not None: data['visual_notes']=visual_notes
     if search_tags is not None: data['search_tags']=clean_tags(search_tags)
     return PREFIX+json.dumps(data,ensure_ascii=False)
 
@@ -230,7 +231,9 @@ def unpack_reply(reply, state=None):
 def history_text(reply):
     if not isinstance(reply,str) or not reply.startswith(PREFIX): return reply
     data=json.loads(reply[len(PREFIX):])
-    return data['text']+'\n[Product photos attached: '+ '; '.join(', '.join(p['tags']) for p in data['photos'])+']'
+    notes=data.get('visual_notes','')
+    numbered='; '.join('Photo '+str(i+1)+': '+', '.join(p['tags']) for i,p in enumerate(data['photos']))
+    return data['text']+'\n[Product photos attached: '+numbered+']'+('\n[Visual inspection notes: '+notes+']' if notes else '')
 
 
 def selection_context(replies):
@@ -242,3 +245,12 @@ def selection_context(replies):
         excluded.update(p['id'] for p in data['photos'] if isinstance(p.get('id'),str))
         if data.get('search_tags'): last_tags=clean_tags(data['search_tags'])
     return {'exclude_ids':sorted(excluded),'last_search_tags':last_tags}
+
+
+def inspect_prepared_photos(photos):
+    import importlib.util
+    root=Path(__file__).resolve().parents[1]
+    spec=importlib.util.spec_from_file_location('esteem_outgoing_vision',root/'telegram-chip/agent/bridge.py')
+    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+    config=json.loads((root/'telegram-chip/agent/config.json').read_text())
+    return module.CodexChat(config).inspect_outgoing(photos,text='Подбери короткую подпись к этим примерам изделий.')

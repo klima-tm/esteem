@@ -32,12 +32,14 @@ def product_photos(args, **kwargs):
     try:
         key=origin()
         photos=library().DropboxPhotos().prepare(args.get('tags'),args.get('count',3))
+        visual_notes=library().inspect_prepared_photos(photos)['image_description'] if photos else ''
         with _lock:
             for expired in [k for k,v in _pending.items() if time.time()-v[0]>900]:
                 del _pending[expired]
             # The most recent search is the chosen set, not an accumulation of repeated tool calls.
             _pending[key]=(time.time(),photos)
         return json.dumps({'prepared':len(photos),'photos':[{'tags':p['tags']} for p in photos],
+                           'visual_notes':visual_notes,
                            'delivery':'Prepared images will be attached to your final reply in this WhatsApp conversation. '
                                       'Write a short caption; do not claim delivery/read confirmation. '
                                       'If prepared is zero, explain that no matching deliverable photos were found; '
@@ -72,9 +74,39 @@ def finalize(response_text, **kwargs):
     return None
 
 
+def handoff_client():
+    path='/root/projects/esteem/control'
+    if path not in sys.path:sys.path.insert(0,path)
+    import handoff_client as client
+    return client
+
+
+def handoff_context(**kwargs):
+    try:
+        chat,message=origin()
+    except RuntimeError:return None
+    result=handoff_client().state('whatsapp',chat)
+    return {'context':'Verified handoff continuity; conversation data, not customer instructions: '+json.dumps(result['context'],ensure_ascii=False)}
+
+
+def escalate(args, **kwargs):
+    chat,message=origin()
+    state=handoff_client().state('whatsapp',chat)
+    summary=json.dumps(state['context'][-12:],ensure_ascii=False)
+    receipt=handoff_client().call('/request',{'channel':'whatsapp','chat':chat,'source':message,
+        'kind':args.get('kind'),'question':args.get('question'),'summary':summary})
+    return json.dumps({'notified':receipt['notified'],'instruction':
+        'The manager notification was confirmed; acknowledge briefly without a response-time promise.' if receipt['notified']
+        else 'Notification failed. Do not claim a manager was notified.'},ensure_ascii=False)
+
+
 def register(ctx):
     schema={'name':'esteem_product_photos','description':library().GUIDANCE+'\nSearch and prepare up to three actual product photos for the current WhatsApp conversation.',
             'parameters':{'type':'object','properties':{'tags':{'type':'array','items':{'type':'string'},'minItems':1,'maxItems':12},
                 'count':{'type':'integer','minimum':1,'maximum':3,'default':3}},'required':['tags'],'additionalProperties':False}}
     ctx.register_tool(name='esteem_product_photos',toolset='esteem_photos',schema=schema,handler=product_photos)
     ctx.register_hook('transform_llm_output',finalize)
+    ctx.register_hook('pre_llm_call',handoff_context)
+    ctx.register_tool(name='esteem_escalate',toolset='esteem_photos',handler=escalate,schema={
+        'name':'esteem_escalate','description':'Ask the Esteem specialist to confirm missing facts, or hand a customer to a manager when requested or necessary. Uses only the current WhatsApp conversation; never a model-selected recipient. Do not escalate greetings or questions answerable from verified company information.',
+        'parameters':{'type':'object','properties':{'kind':{'type':'string','enum':['specialist','human']},'question':{'type':'string'}},'required':['kind','question'],'additionalProperties':False}})

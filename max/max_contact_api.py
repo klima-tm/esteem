@@ -41,6 +41,22 @@ def install(client,replies,ready):
             db.execute("UPDATE contact_requests SET status='sent',message_id=? WHERE id=?",(sent.id,key))
             db.execute('INSERT OR IGNORE INTO history(chat_id,message_id,role,text) VALUES(?,?,?,?)',(cid,sent.id,'assistant',text))
         return {'success':True,'message_id':sent.id}
+    async def handoff_answer(p):
+        cid=int(p['chat_id'])
+        if cid not in replies.allowed.values() or not ready.is_set():raise ValueError('Conversation not authorized')
+        text=p['message'];key=p['request_id'];encoded=json.dumps([cid,text])
+        if not isinstance(text,str) or not text.strip() or len(text)>3000:raise ValueError('Invalid answer')
+        row=db.execute('SELECT * FROM contact_requests WHERE id=?',(key,)).fetchone()
+        if row:raise RuntimeError('Request already processed; check status')
+        with db:db.execute("INSERT INTO contact_requests VALUES (?,?,'sending',NULL)",(key,encoded))
+        try:sent=await asyncio.wait_for(client.send_message(chat_id=cid,text=text),45)
+        except BaseException:
+            with db:db.execute("UPDATE contact_requests SET status='uncertain' WHERE id=?",(key,))
+            raise
+        with db:
+            db.execute("UPDATE contact_requests SET status='sent',message_id=? WHERE id=?",(sent.id,key))
+            db.execute('INSERT OR IGNORE INTO history(chat_id,message_id,role,text) VALUES(?,?,?,?)',(cid,sent.id,'assistant',text))
+        return {'success':True,'message_id':sent.id}
     async def resolve(p):
         if not ready.is_set() or not client.me or client.me.contact.id!=replies.config['expected_sender_id']:
             raise RuntimeError('MAX not ready')
@@ -52,13 +68,13 @@ def install(client,replies,ready):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self,*a):pass
         def do_POST(self):
-            if self.path not in ('/contact','/resolve'):self.send_error(404);return
+            if self.path not in ('/contact','/resolve','/handoff-answer'):self.send_error(404);return
             if not hmac.compare_digest(self.headers.get('Authorization',''),'Bearer '+token):self.send_error(403);return
             try:
                 size=int(self.headers.get('Content-Length',0))
                 if not 0<size<=16000:raise ValueError('Invalid size')
                 payload=json.loads(self.rfile.read(size))
-                future=asyncio.run_coroutine_threadsafe(resolve(payload) if self.path=='/resolve' else contact(payload),loop)
+                future=asyncio.run_coroutine_threadsafe(resolve(payload) if self.path=='/resolve' else handoff_answer(payload) if self.path=='/handoff-answer' else contact(payload),loop)
                 result=future.result(timeout=100);status=200
             except Exception:result={'success':False,'error':'Contact not confirmed; check status before retrying'};status=500
             body=json.dumps(result).encode();self.send_response(status);self.send_header('Content-Type','application/json');self.end_headers();self.wfile.write(body)

@@ -1,0 +1,18 @@
+[Unit]
+Description=Esteem private manager handoff coordinator
+Wants=network-online.target esteem-telegram.service
+After=network-online.target esteem-telegram.service
+[Service]
+Type=simple
+WorkingDirectory=/root/projects/esteem/control
+ExecStart=/usr/bin/python3 /root/projects/esteem/control/handoff_service.py
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/root/projects/esteem/control/state
+[Install]
+WantedBy=multi-user.target
