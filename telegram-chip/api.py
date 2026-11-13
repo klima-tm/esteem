@@ -34,6 +34,21 @@ class SendFileRequest(BaseModel):
     parse_mode: Optional[str] = None
 
 
+class SendPhotoAlbumRequest(BaseModel):
+    chat_id: Union[int, str]
+    file_paths: List[str] = Field(min_length=1, max_length=5)
+    caption: str = Field(default='', max_length=1000)
+    reply_to: Optional[int] = None
+
+
+class MarkReadRequest(BaseModel):
+    max_id: int = Field(gt=0, strict=True)
+
+
+class TypingRequest(BaseModel):
+    active: bool = Field(True, strict=True)
+
+
 class EditMessageRequest(BaseModel):
     chat_id: Union[int, str]
     message_id: int
@@ -270,6 +285,21 @@ async def get_message(
     return make_response(result)
 
 
+@app.post("/chats/{chat_id}/read", response_model=ApiResponse)
+async def mark_read(chat_id: str, request: MarkReadRequest):
+    try:
+        result = await telegram.mark_read(chat_id, request.max_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return ApiResponse(success=True, data=json.dumps(result))
+
+
+@app.post("/chats/{chat_id}/typing", response_model=ApiResponse)
+async def set_typing(chat_id: str, request: TypingRequest):
+    result = await telegram.set_typing(chat_id, request.active)
+    return ApiResponse(success=True, data=json.dumps(result))
+
+
 @app.post("/messages/send", response_model=ApiResponse)
 async def send_message(request: SendMessageRequest):
     """Send a message to a chat."""
@@ -294,6 +324,16 @@ async def send_file(request: SendFileRequest):
         parse_mode=request.parse_mode,
     )
     return make_response(result)
+
+
+@app.post("/messages/send-photo-album", response_model=ApiResponse)
+async def send_photo_album(request: SendPhotoAlbumRequest):
+    """Send up to five prepared product photos as one native Telegram album."""
+    result = await telegram.send_photo_album(
+        chat_id=request.chat_id, file_paths=request.file_paths,
+        caption=request.caption, reply_to=request.reply_to,
+    )
+    return ApiResponse(success=True, data=json.dumps(result))
 
 
 @app.put("/messages/edit", response_model=ApiResponse)

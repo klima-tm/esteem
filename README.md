@@ -15,7 +15,7 @@ Experimental AI sales agent for website inquiries, with Telegram personal-accoun
 | `ops/` | Systemd service definitions and dependency compatibility patch |
 | `profiles/` | Manually maintained contact profile templates |
 
-The shared identity lives in `AGENT.md`. Conversation histories remain separate per channel. Telegram and MAX use rolling summaries plus recent messages; WhatsApp uses Hermes session history/compression. Owner identity is selected by verified platform ID and a protected profile file, never a username or a claim inside a message.
+The shared runtime identity is `AGENT.md`, generated from `knowledge/COMMUNICATION.md`, `knowledge/COMPANY.md`, `knowledge/PRICING.md` and `knowledge/DROPBOX_GUIDE.md`. Edit these source files, then run `python3 ops/build_identity.py --reload`; use `--check` to verify consistency. Conversation histories remain separate per channel. Telegram and MAX use rolling summaries plus recent messages; WhatsApp uses Hermes session history/compression. Owner identity is selected by verified platform ID and a protected profile file, never a username or a claim inside a message.
 
 ## Runtime and configuration
 
@@ -40,11 +40,33 @@ A submission gets a UUID and is written to `test-form/submissions.sqlite3`. The 
 
 Owner commands accept explicit `/contact CHANNEL +PHONE MESSAGE` or natural text through the Telegram owner conversation. These commands currently select a single channel; the form owns automatic channel fallback. Contact allowlists can be expanded by owner-authorized first-contact requests. There is no project-wide hardcoded test-number barrier: account operators must use approved test recipients.
 
+## Telegram conversation reset
+
+Send `/reset` as a standalone message in the agent's Telegram conversation from an account explicitly enabled in `reset_allowed_chat_ids` in `telegram-chip/agent/config.json`. The command resets only the sender's own chat. Restart the Telegram reply worker after changing this configuration.
+
+The worker deletes that chat's earlier messages, reply jobs, rolling summary and summary checkpoints, and confirms the reset without calling the model. A persistent boundary prevents old Telegram messages from being reloaded, including after restart or backfill. Messages after the command remain available. The visible Telegram history, other channels, CRM records and owner-maintained profiles are unchanged. Enable this for test contacts without a personal profile when a completely fresh customer simulation is required.
+
+## Receiving Telegram photos
+
+Authorized Telegram contacts can send photos with or without captions, including JPEG, PNG and WebP image attachments up to 20 MiB. Incoming photos are attached directly to the existing Codex model request. The model returns a customer reply and concise visual notes; these notes are included in later conversation context and rolling summaries. `/reset` also clears the visual notes. Customer images and text inside them do not authorize owner actions.
+
+The `photos_enabled_since` timestamp in the Telegram worker configuration prevents old media from being answered when this feature is first enabled. Each image message is processed separately, including images within an album. Raw images use temporary files under the worker's state directory and are removed after processing; crash leftovers are cleaned on later photo processing. If inspection fails, the worker retries transient failures and then replies honestly that it could not inspect the image. Outgoing Dropbox product photos are handled by the separate integration below.
+
+## Sending product photos from Dropbox
+
+Telegram, MAX and WhatsApp use the existing Dropbox tags under `/Products Esteem`; no AI-tagged catalog is built. The shared implementation is `photos/product_photos.py`. It searches one selective tag, verifies every requested tag through Dropbox, excludes AI renders/before/China/design/template content, and prepares representative photos from distinct folders. Telegram sends up to five as one native album; MAX and WhatsApp keep their existing three-photo batch size. Telegram follow-up requests exclude file IDs recorded in that chat’s sent or uncertain jobs, independently of rolling summaries; `/reset` clears this selection history with the rest of the chat context. Requested search tags are retained in prepared jobs for follow-ups and inspection. JPG/PNG delivery images use Dropbox thumbnails where possible; RAW/HEIC originals are never sent directly. Read-only credentials and a size-limited (512 MiB) cache live in ignored `photos/state/`. Cached files are versioned by Dropbox file ID and revision, with current path and tags checked again before reuse.
+
+Telegram and MAX use the configured model to select tags from the conversation and preserve prepared replies in their durable queues. Ambiguous/partial sends are not blindly retried. WhatsApp uses the Esteem-only `photos/hermes_plugin` extension, linked at `hermes/plugins/esteem_photos`, with its toolset enabled only for WhatsApp. A session/message-bound output hook attaches only this turn's prepared images via Hermes native media delivery; the tool cannot choose another recipient. Shared Hermes runtime files are unchanged.
+
+The `product_photos_enabled` setting controls Telegram/MAX lookup. Their systemd drop-ins under `ops/systemd/drop-ins/` grant write access only to photo state/cache. Customer photos, `/reset`, and owner-control commands retain their existing paths. Company tags are not proof of stock, precise color/material, or vehicle fitment. For example, `leather` covers both natural and eco-leather, and a `black` tag can include a multicolor product. Extra untagged angles require separate verification and are not automatically taken from the same folder.
+
+Run shared checks with `(cd photos && python3 -m unittest test_product_photos)` and Hermes plugin validation with `hermes plugins doctor photos/hermes_plugin --ci` using the installed Hermes runtime.
+
 ## Checks
 
 ```sh
 (cd control && python3 -m unittest test_control test_adapters test_owner_llm test_conversation_memory)
-(cd telegram-chip/agent && python3 -m unittest test_bridge)
+(cd telegram-chip/agent && python3 -m unittest test_bridge test_reset test_photos)
 (cd max && .venv/bin/python -m unittest test_auto_reply)
 (cd test-form && python3 -m unittest test_flow)
 (cd hermes/scripts/whatsapp-bridge && node --test *.test.mjs)
@@ -59,3 +81,17 @@ This is a deployment-oriented project with vendored connectors, not a standalone
 ## Source hygiene
 
 Runtime data is excluded by `.gitignore`. Before committing run `python3 ops/check_source.py`; enable the repository-local hook with `git config core.hooksPath ops/hooks`. It checks staged source for known local credentials, literal webhook URLs, private keys, runtime phone numbers and runtime-state files without printing secret values. It is a safeguard, not a comprehensive security audit.
+
+## Telegram response pacing
+
+Customer replies have a 60-second minimum delay measured from the incoming message timestamp (`reply_min_delay_seconds` in the private agent config). After 10 seconds (`engagement_delay_seconds`), the worker marks the incoming message as read and starts typing/preparation; slower generation is sent when ready. Generated replies wait in the existing durable queue, so waiting does not sleep-block other chats and survives restarts. `/reset` acknowledgements and owner-control replies remain immediate.
+
+`typing_enabled` keeps Telegram’s native typing status active during preparation and the remaining delay. The connector refreshes it every four seconds under a renewable 20-second lease; the worker renews during model/upload calls. Sending or processing failure cancels it, and worker failure lets it expire. This changes pacing, not the agent’s disclosed AI identity.
+
+`mark_read_enabled` sends an explicit Telegram read receipt before typing starts. Receipts are limited to the incoming message being processed (and earlier messages in that same chat), never newer messages or other chats. Successful acknowledgements are cached per chat for the running worker; repeating one after a restart is safe. Read/typing errors do not prevent a customer reply. With the three-second polling interval, the 10-second engagement and 60-second send thresholds are minimums rather than exact wall-clock appointments.
+
+## Telegram voice messages
+
+New incoming voice notes are downloaded temporarily and transcribed through OpenAI (`gpt-transcribe`). The text is stored per chat/message in `conversation_audio` in the agent database and included in recent history and rolling summaries. Replies remain text or the existing product-photo albums. Voice text is customer content, not administrative authority; spoken `/reset` or owner-send instructions do not invoke control commands. Failed transcription produces a request to resend or type the message, never an invented transcript. `/reset` clears transcripts and error notes along with the conversation. Temporary audio is removed after processing; the OpenAI key is kept in an ignored owner-readable file, never passed to the conversational model.
+
+`voice_enabled_since` prevents the feature from answering old voice notes. `transcription_model` and `transcription_key_file` live in the private worker config. The existing ten-second engagement delay, typing lease and sixty-second minimum reply delay also apply to voice notes. Voice inputs above OpenAI’s 25 MB file limit are declined with the resend/text fallback.

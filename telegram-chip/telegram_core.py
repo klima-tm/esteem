@@ -446,6 +446,8 @@ class TelegramCore:
     def __init__(self):
         self.client: Optional[TelegramClient] = None
         self._started = False
+        self._typing_tasks = {}
+        self._typing_deadlines = {}
         
         # Rate limiting tracking
         self._last_request_time: Optional[float] = None
@@ -484,6 +486,10 @@ class TelegramCore:
 
     async def stop(self):
         """Stop the Telegram client."""
+        tasks=list(self._typing_tasks.values())
+        for task in tasks: task.cancel()
+        if tasks: await asyncio.gather(*tasks, return_exceptions=True)
+        self._typing_tasks.clear();self._typing_deadlines.clear()
         if self.client and self._started:
             await self.client.disconnect()
             self._started = False
@@ -635,15 +641,20 @@ class TelegramCore:
                     continue
                 if msg.date <= since_dt:
                     continue
-                if not msg.message:
-                    continue  # skip media-only
+                from media_info import incoming_image_info, incoming_voice_info
+                image_info = incoming_image_info(getattr(msg, 'media', None))
+                voice_info = incoming_voice_info(getattr(msg, 'media', None))
+                if not msg.message and image_info is None and voice_info is None:
+                    continue
                 sender_name = get_sender_name(msg)
                 new_msgs.append({
                     "msg_id": msg.id,
                     "sender_name": sender_name,
                     "date": msg.date.isoformat(),
-                    "text": msg.message,
+                    "text": msg.message or "",
                     "out": msg.out,
+                    "image": image_info,
+                    "voice": voice_info,
                 })
 
             if new_msgs:
@@ -1245,6 +1256,58 @@ class TelegramCore:
         logger.warning("send refused: contact %s never wrote first", getattr(entity, "id", "?"))
         raise SendRefusedError()
 
+    async def mark_read(self, chat_id, max_id):
+        """Acknowledge only through a verified incoming message in this chat."""
+        chat_id,error=validate_ids('chat_id',chat_id)
+        if error:raise ValueError(error)
+        if type(max_id) is not int or max_id<=0:raise ValueError('A positive message ID is required')
+        await self._wait_for_rate_limit()
+        entity=await self.client.get_entity(chat_id)
+        message=await self.client.get_messages(entity,ids=max_id)
+        if (message is None or message.id!=max_id or message.out is not False
+                or message.chat_id!=utils.get_peer_id(entity)):
+            raise ValueError('Target must be an incoming message in the specified chat')
+        acknowledged=await self.client.send_read_acknowledge(entity,max_id=max_id)
+        if not acknowledged:raise RuntimeError('Read acknowledgement was not confirmed')
+        return {'read_through_message_id':max_id,'acknowledged':True}
+
+    async def _typing_loop(self, chat_id, entity):
+        try:
+            async with self.client.action(entity, 'typing', delay=4, auto_cancel=True):
+                while True:
+                    remaining=self._typing_deadlines.get(chat_id,0)-asyncio.get_running_loop().time()
+                    if remaining<=0: break
+                    await asyncio.sleep(min(4,remaining))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logging.getLogger(__name__).warning('Typing indicator failed (%s)',type(exc).__name__)
+        finally:
+            if self._typing_tasks.get(chat_id) is asyncio.current_task():
+                self._typing_tasks.pop(chat_id,None);self._typing_deadlines.pop(chat_id,None)
+
+    async def set_typing(self, chat_id, active=True):
+        """A renewable 20-second lease: worker failure cannot leave typing on forever."""
+        chat_id,error=validate_ids('chat_id',chat_id)
+        if error: raise ValueError(error)
+        if type(active) is not bool: raise ValueError('active must be a boolean')
+        task=self._typing_tasks.get(chat_id)
+        if not active:
+            if task:
+                task.cancel();await asyncio.gather(task,return_exceptions=True)
+            self._typing_tasks.pop(chat_id,None);self._typing_deadlines.pop(chat_id,None)
+            return {'typing':False}
+        if not task or task.done():
+            entity=await self.client.get_entity(chat_id)
+            await self._ensure_may_write(entity)
+            # Recheck after awaits: concurrent renewals must not create duplicate loops.
+            task=self._typing_tasks.get(chat_id)
+            if not task or task.done():
+                task=asyncio.create_task(self._typing_loop(chat_id,entity))
+                self._typing_tasks[chat_id]=task
+        self._typing_deadlines[chat_id]=asyncio.get_running_loop().time()+20
+        return {'typing':True,'lease_seconds':20}
+
     async def send_message(
         self,
         chat_id: Union[int, str],
@@ -1345,6 +1408,37 @@ class TelegramCore:
                 return log_and_format_error("send_file", retry_e, chat_id=chat_id)
         except Exception as e:
             return log_and_format_error("send_file", e, chat_id=chat_id)
+
+    async def send_photo_album(self, chat_id, file_paths, caption='', reply_to=None):
+        """One album submission; ambiguous failures must never trigger a blind resend."""
+        chat_id,error=validate_ids('chat_id',chat_id)
+        if error: raise ValueError(error)
+        if not isinstance(file_paths,list) or not 1<=len(file_paths)<=5:
+            raise ValueError('Select 1–5 product photos')
+        cache=(Path(__file__).resolve().parent.parent/'photos/state/photo-cache').resolve()
+        paths=[Path(p).resolve() for p in file_paths]
+        if len(set(paths))!=len(paths) or not isinstance(caption,str) or len(caption)>1000:
+            raise ValueError('Invalid photo album')
+        for p in paths:
+            if (p.parent!=cache or not re.fullmatch(r'[a-f0-9]{64}\.(jpg|png)',p.name)
+                    or not p.is_file() or not 0<p.stat().st_size<=8*1024*1024):
+                raise ValueError('Invalid prepared product photo')
+        await self._check_message_rate_limit(chat_id)
+        await self._wait_for_rate_limit()
+        entity=await self.client.get_entity(chat_id)
+        await self._ensure_may_write(entity)
+        # A list is the Telethon album API; only the first item receives a caption.
+        result=await self.client.send_file(entity,[str(p) for p in paths],
+            caption=[caption]+['']*(len(paths)-1),reply_to=reply_to,
+            parse_mode=None,force_document=False)
+        messages=result if isinstance(result,(list,tuple)) else [result]
+        ids=[getattr(m,'id',None) for m in messages]
+        groups={getattr(m,'grouped_id',None) for m in messages}
+        if (len(ids)!=len(paths) or any(type(i) is not int or i<=0 for i in ids)
+                or len(set(ids))!=len(ids)
+                or (len(paths)>1 and (len(groups)!=1 or None in groups))):
+            raise RuntimeError('Photo album send outcome uncertain')
+        return {'message_ids':ids,'grouped_id':next(iter(groups))}
 
     async def edit_message(
         self, chat_id: Union[int, str], message_id: int, new_text: str

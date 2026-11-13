@@ -65,3 +65,13 @@ node_modules/
 
 # Upstream CI templates are not Esteem CI.
 /max/.github/
+
+# Local agent identity and communication instructions
+/AGENT.md
+/knowledge/COMMUNICATION.md
+/knowledge/DROPBOX_GUIDE.md
+/knowledge/COMPANY.md
+/knowledge/PRICING.md
+/knowledge/PUBLIC_RESOURCES.md
+/knowledge/SOURCE_INVENTORY.json
+/knowledge/sources/MATS_COMPANY_NOTES_2026-11-12.md

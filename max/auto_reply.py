@@ -13,6 +13,14 @@ LOG = logging.getLogger('esteem.max')
 ROOT = Path(__file__).resolve().parent
 
 
+def product_photos_module():
+    import sys
+    path=str(ROOT.parent/'photos')
+    if path not in sys.path:sys.path.insert(0,path)
+    import product_photos
+    return product_photos
+
+
 class Replies:
     def __init__(self, config, model):
         self.config, self.model = config, model
@@ -93,7 +101,13 @@ class Replies:
         with self.db:
             self.db.execute("UPDATE jobs SET status='sending' WHERE chat_id=? AND message_id=?",key)
         try:
-            sent = await asyncio.wait_for(client.send_message(chat_id=key[0],text=reply),timeout=45)
+            if reply.startswith('\x1eESTEEM_PHOTOS_V1:'):
+                from pymax import Photo
+                caption,photos=product_photos_module().unpack_reply(reply)
+                sent=await asyncio.wait_for(client.send_message(chat_id=key[0],text=caption,
+                    attachments=[Photo(path=p['path']) for p in photos]),timeout=120)
+            else:
+                sent = await asyncio.wait_for(client.send_message(chat_id=key[0],text=reply),timeout=45)
         except Exception as exc:
             with self.db:
                 self.db.execute("UPDATE jobs SET status='uncertain' WHERE chat_id=? AND message_id=?",key)
@@ -102,7 +116,8 @@ class Replies:
         with self.db:
             self.db.execute("UPDATE jobs SET status='sent',reply_id=? WHERE chat_id=? AND message_id=?",(sent.id,*key))
             self.db.execute('INSERT OR IGNORE INTO history(chat_id,message_id,role,text) VALUES(?,?,?,?)',(*key,'user',row['text']))
-            self.db.execute('INSERT OR IGNORE INTO history(chat_id,message_id,role,text) VALUES(?,?,?,?)',(key[0],sent.id,'assistant',reply))
+            visible=product_photos_module().history_text(reply) if reply.startswith('\x1eESTEEM_PHOTOS_V1:') else reply
+            self.db.execute('INSERT OR IGNORE INTO history(chat_id,message_id,role,text) VALUES(?,?,?,?)',(key[0],sent.id,'assistant',visible))
         LOG.info('Replied to authorized MAX test message %s',key[1])
 
     async def worker(self, client):

@@ -15,6 +15,24 @@ from typing import Any, Dict, Optional
 TRANSCRIBABLE_KINDS = {"voice", "video_note", "audio", "video"}
 
 
+def incoming_image_info(media: Any) -> Optional[Dict[str, Any]]:
+    """Only actual attached still images, never link previews or stickers."""
+    info = describe_media(media)
+    if info is None or info.via_webpage:
+        return None
+    if info.kind == 'photo' or (info.kind == 'document' and info.mime_type in
+                               ('image/jpeg', 'image/png', 'image/webp')):
+        return {'kind': info.kind, 'mime_type': info.mime_type, 'size': info.size}
+    return None
+
+
+def incoming_voice_info(media: Any) -> Optional[Dict[str, Any]]:
+    """Only attached Telegram voice notes; exclude link previews, music and video."""
+    info=describe_media(media)
+    if info is None or info.via_webpage or info.kind!='voice':return None
+    return {'kind':'voice','mime_type':info.mime_type,'size':info.size,'duration':info.duration}
+
+
 @dataclass
 class MediaInfo:
     """Normalized description of a message attachment."""

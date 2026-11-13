@@ -1,0 +1,7 @@
+name: esteem_photos
+version: 1.0.0
+description: Read-only Esteem Dropbox tag search and native WhatsApp product photos
+provides_tools:
+  - esteem_product_photos
+provides_hooks:
+  - transform_llm_output
