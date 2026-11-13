@@ -1,0 +1,8 @@
+{
+  "name": "esteem-codex-runtime",
+  "private": true,
+  "version": "1.0.0",
+  "dependencies": {
+    "@openai/codex": "0.169.0"
+  }
+}

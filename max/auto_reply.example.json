@@ -1,6 +1,6 @@
 {
-  "model": "gpt-5.6-sol",
-  "codex_bin": "/usr/bin/codex",
+  "model": "gpt-6.1-sol",
+  "codex_bin": "/opt/esteem/codex-0.169.0/node_modules/.bin/codex",
   "model_timeout_seconds": 120,
   "memory_file": "/root/projects/esteem/AGENT.md",
   "workspace": "/root/projects/esteem/max/reply-workspace",

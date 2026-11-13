@@ -4,7 +4,7 @@ platforms:
     extra:
       bridge_port: 3011
 model:
-  default: gpt-5.6-sol
+  default: gpt-6.1-sol
   provider: openai-codex
 agent:
   reasoning_effort: high
